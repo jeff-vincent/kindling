@@ -70,6 +70,11 @@ test: manifests generate fmt vet envtest ## Run tests.
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
+.PHONY: cli
+cli: ## Build the kindling CLI binary.
+	cd cli && go build -o ../bin/kindling .
+	@echo "✅ bin/kindling built — run: ./bin/kindling --help"
+
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go

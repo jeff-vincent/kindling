@@ -287,7 +287,56 @@ With the above, the operator creates:
 | [kubectl](https://kubernetes.io/docs/tasks/tools/) | 1.28+ |
 | [Docker](https://docs.docker.com/get-docker/) | 24+ (for building the operator image only — app images use Kaniko) |
 
-### 1. Create a local Kind cluster
+### Option A: Use the CLI (recommended)
+
+The `kindling` CLI wraps the entire bootstrap flow into simple commands:
+
+```bash
+# Build the CLI
+make cli
+
+# Bootstrap everything: Kind cluster + ingress + registry + operator
+./bin/kindling init
+
+# Register a self-hosted GitHub Actions runner
+./bin/kindling quickstart -u <github-user> -r <owner/repo> -t <pat>
+
+# Deploy a dev staging environment
+./bin/kindling deploy -f examples/sample-app/dev-environment.yaml
+
+# View cluster status at a glance
+./bin/kindling status
+
+# Tail the operator logs
+./bin/kindling logs
+
+# Tear everything down
+./bin/kindling destroy
+```
+
+<details>
+<summary><strong>CLI command reference</strong></summary>
+
+| Command | Description |
+|---|---|
+| `kindling init` | Create Kind cluster, install ingress + registry, build & deploy operator |
+| `kindling quickstart` | Create GitHub PAT secret + runner pool CR (interactive prompts for missing values) |
+| `kindling deploy -f <file>` | Apply a DevStagingEnvironment from a YAML file |
+| `kindling status` | Dashboard view of cluster, operator, runners, environments, and ingress routes |
+| `kindling logs` | Tail the kindling controller logs (`-f` for follow, `--all` for all containers) |
+| `kindling destroy` | Delete the Kind cluster (with confirmation prompt, or `-y` to skip) |
+| `kindling version` | Print CLI version |
+
+Global flags: `-c <name>` (cluster name, default `dev`), `-p <path>` (project directory).
+
+</details>
+
+### Option B: Manual setup
+
+<details>
+<summary><strong>Step-by-step without the CLI</strong></summary>
+
+#### 1. Create a local Kind cluster
 
 Use the included config to enable Ingress support (maps ports 80/443 to localhost) and configure the containerd registry mirror for the in-cluster registry:
 
@@ -307,7 +356,7 @@ This deploys:
 
 > **Note:** If you skip this step and use a plain `kind create cluster`, you'll need to use `kubectl port-forward` instead of `.localhost` hostnames, and image builds won't work without a registry.
 
-### 2. Build and deploy the operator
+#### 2. Build and deploy the operator
 
 ```bash
 # Build the operator image
@@ -321,7 +370,7 @@ make install
 make deploy IMG=controller:latest
 ```
 
-### 3. Create the GitHub token Secret and runner pool
+#### 3. Create the GitHub token Secret and runner pool
 
 Generate a [GitHub Personal Access Token](https://github.com/settings/tokens) with **`repo`** scope, then use the quickstart target:
 
@@ -331,6 +380,8 @@ make quickstart \
   GITHUB_REPO=your-org/your-repo \
   GITHUB_PAT=ghp_YOUR_TOKEN_HERE
 ```
+
+</details>
 
 This creates the Secret and `GithubActionRunnerPool` CR in one command. The operator will:
 1. Auto-provision a **ServiceAccount + ClusterRole + ClusterRoleBinding** for the runner
@@ -410,6 +461,18 @@ A simpler [sample app](examples/sample-app/) demonstrates the full loop with a s
 │   ├── githubactionrunnerpool_types.go  #   GithubActionRunnerPool spec & status
 │   ├── groupversion_info.go             #   apps.example.com/v1alpha1 registration
 │   └── zz_generated.deepcopy.go         #   auto-generated DeepCopy methods
+├── cli/                                 # kindling CLI tool
+│   ├── main.go                          #   CLI entrypoint
+│   ├── cmd/                             #   Cobra command implementations
+│   │   ├── root.go                      #     Root command + global flags
+│   │   ├── init.go                      #     Bootstrap cluster + operator
+│   │   ├── quickstart.go                #     Register GitHub runner
+│   │   ├── deploy.go                    #     Apply DevStagingEnvironment
+│   │   ├── status.go                    #     Cluster dashboard
+│   │   ├── logs.go                      #     Tail controller logs
+│   │   ├── destroy.go                   #     Tear down cluster
+│   │   └── version.go                   #     Print version
+│   └── go.mod                           #   Separate Go module (cobra)
 ├── cmd/main.go                          # Operator entrypoint & controller wiring
 ├── examples/
 │   ├── sample-app/                      # Single-service reference app
@@ -553,7 +616,7 @@ kind delete cluster --name dev
 - [x] Build-agent sidecar architecture — runner image stays stock/unprivileged
 - [x] Auto-provisioned RBAC per runner pool
 - [x] In-cluster container registry for Kaniko → containerd image flow
-- [ ] CLI bootstrap tool — one command to create cluster + install operator + register runner
+- [x] CLI bootstrap tool — `kindling init` + `kindling quickstart` + `kindling deploy` + `kindling status`
 - [ ] Webhook receiver for GitHub push events as an alternative to long-polling
 
 ---

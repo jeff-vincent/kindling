@@ -1,0 +1,185 @@
+package cmd
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/spf13/cobra"
+)
+
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show the status of the cluster, operator, runners, and environments",
+	Long: `Displays a dashboard-style overview of the Kind cluster including:
+  • Cluster info and node status
+  • kindling operator health
+  • GitHub Actions runner pools
+  • Dev staging environments and their dependencies`,
+	RunE: runStatus,
+}
+
+func init() {
+	rootCmd.AddCommand(statusCmd)
+}
+
+func runStatus(cmd *cobra.Command, args []string) error {
+	// ── Cluster ─────────────────────────────────────────────────
+	header("Cluster")
+
+	if !clusterExists(clusterName) {
+		fail(fmt.Sprintf("Kind cluster %q not found. Run: kindling init", clusterName))
+		return nil
+	}
+	success(fmt.Sprintf("Kind cluster %q exists", clusterName))
+
+	nodesOut, err := runCapture("kubectl", "get", "nodes",
+		"-o", "custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type,VERSION:.status.nodeInfo.kubeletVersion",
+		"--no-headers")
+	if err == nil && nodesOut != "" {
+		for _, line := range strings.Split(nodesOut, "\n") {
+			fmt.Printf("    %s\n", strings.TrimSpace(line))
+		}
+	}
+
+	// ── Operator ────────────────────────────────────────────────
+	header("Operator")
+
+	operatorOut, err := runCapture("kubectl", "get", "deployment",
+		"-n", "kindling-system",
+		"-o", "custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas,AGE:.metadata.creationTimestamp",
+		"--no-headers")
+	if err != nil || operatorOut == "" {
+		warn("Controller not found in kindling-system namespace")
+	} else {
+		for _, line := range strings.Split(operatorOut, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if strings.Contains(line, "<none>") {
+				fmt.Printf("    %s⚠%s  %s\n", colorYellow, colorReset, line)
+			} else {
+				fmt.Printf("    %s✓%s  %s\n", colorGreen, colorReset, line)
+			}
+		}
+	}
+
+	// ── Registry ────────────────────────────────────────────────
+	header("Registry")
+
+	regOut, err := runCapture("kubectl", "get", "deployment/registry",
+		"-o", "custom-columns=READY:.status.readyReplicas,DESIRED:.spec.replicas",
+		"--no-headers")
+	if err != nil {
+		warn("In-cluster registry not found")
+	} else {
+		fmt.Printf("    registry:5000  %s\n", strings.TrimSpace(regOut))
+	}
+
+	// ── Ingress ─────────────────────────────────────────────────
+	header("Ingress Controller")
+
+	ingOut, err := runCapture("kubectl", "get", "pods",
+		"-n", "ingress-nginx",
+		"-l", "app.kubernetes.io/component=controller",
+		"-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount",
+		"--no-headers")
+	if err != nil || ingOut == "" {
+		warn("ingress-nginx controller not found")
+	} else {
+		for _, line := range strings.Split(ingOut, "\n") {
+			fmt.Printf("    %s\n", strings.TrimSpace(line))
+		}
+	}
+
+	// ── Runner Pools ────────────────────────────────────────────
+	header("GitHub Actions Runner Pools")
+
+	rpOut, err := runCapture("kubectl", "get", "githubactionrunnerpools",
+		"-o", "custom-columns=NAME:.metadata.name,USERNAME:.spec.githubUsername,REPO:.spec.repository",
+		"--no-headers")
+	if err != nil || rpOut == "" || strings.Contains(rpOut, "No resources") {
+		fmt.Printf("    %sNone — run:%s kindling quickstart\n", colorDim, colorReset)
+	} else {
+		for _, line := range strings.Split(rpOut, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				fmt.Printf("    🏃 %s\n", line)
+			}
+		}
+
+		// Show runner deployment status
+		fmt.Println()
+		runnerDeploys, _ := runCapture("kubectl", "get", "deployments",
+			"-l", "app.kubernetes.io/managed-by=kindling",
+			"-o", "custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas",
+			"--no-headers")
+		if runnerDeploys != "" {
+			for _, line := range strings.Split(runnerDeploys, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					fmt.Printf("      ↳ %s\n", line)
+				}
+			}
+		}
+	}
+
+	// ── Dev Staging Environments ────────────────────────────────
+	header("Dev Staging Environments")
+
+	dseOut, err := runCapture("kubectl", "get", "devstagingenvironments",
+		"-o", "custom-columns=NAME:.metadata.name,IMAGE:.spec.deployment.image,PORT:.spec.deployment.port,INGRESS:.spec.ingress.host",
+		"--no-headers")
+	if err != nil || dseOut == "" || strings.Contains(dseOut, "No resources") {
+		fmt.Printf("    %sNone — run:%s kindling deploy -f <file.yaml>\n", colorDim, colorReset)
+	} else {
+		for _, line := range strings.Split(dseOut, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			fmt.Printf("    📦 %s\n", line)
+		}
+	}
+
+	// ── Deployments ─────────────────────────────────────────────
+	header("All Deployments")
+
+	depOut, _ := runCapture("kubectl", "get", "deployments",
+		"-o", "custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,UP-TO-DATE:.status.updatedReplicas,AVAILABLE:.status.availableReplicas",
+		"--no-headers")
+	if depOut != "" {
+		for _, line := range strings.Split(depOut, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				fmt.Printf("    %s\n", line)
+			}
+		}
+	}
+
+	// ── Ingress Routes ──────────────────────────────────────────
+	header("Ingress Routes")
+
+	ingRoutes, err := runCapture("kubectl", "get", "ingress",
+		"-o", "custom-columns=NAME:.metadata.name,HOST:.spec.rules[*].host,SERVICE:.spec.rules[*].http.paths[*].backend.service.name",
+		"--no-headers")
+	if err != nil || ingRoutes == "" || strings.Contains(ingRoutes, "No resources") {
+		fmt.Printf("    %sNo ingress routes configured%s\n", colorDim, colorReset)
+	} else {
+		for _, line := range strings.Split(ingRoutes, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				// Extract host for a clickable link
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					fmt.Printf("    🌐 http://%s  →  %s\n", parts[1], line)
+				} else {
+					fmt.Printf("    🌐 %s\n", line)
+				}
+			}
+		}
+	}
+
+	fmt.Println()
+	return nil
+}

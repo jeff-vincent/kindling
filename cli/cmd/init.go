@@ -1,0 +1,154 @@
+package cmd
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/spf13/cobra"
+)
+
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Bootstrap a Kind cluster with the kindling operator",
+	Long: `Creates a Kind cluster, installs the in-cluster image registry and
+ingress-nginx controller, builds the kindling operator image, and deploys
+it into the cluster.
+
+This is the equivalent of running:
+  kind create cluster --name dev --config kind-config.yaml
+  ./setup-ingress.sh
+  make docker-build IMG=controller:latest
+  kind load docker-image controller:latest --name dev
+  make install deploy IMG=controller:latest`,
+	RunE: runInit,
+}
+
+var skipCluster bool
+
+func init() {
+	initCmd.Flags().BoolVar(&skipCluster, "skip-cluster", false, "Skip Kind cluster creation (use existing cluster)")
+	rootCmd.AddCommand(initCmd)
+}
+
+func runInit(cmd *cobra.Command, args []string) error {
+	dir, err := resolveProjectDir()
+	if err != nil {
+		return err
+	}
+
+	// ── Preflight checks ────────────────────────────────────────
+	header("Preflight checks")
+
+	missing := []string{}
+	for _, tool := range []string{"kind", "kubectl", "docker", "make", "go"} {
+		if commandExists(tool) {
+			step("✓", fmt.Sprintf("%s found", tool))
+		} else {
+			missing = append(missing, tool)
+			fail(fmt.Sprintf("%s not found on PATH", tool))
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required tools: %v", missing)
+	}
+
+	configPath := filepath.Join(dir, "kind-config.yaml")
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("kind-config.yaml not found in %s — are you in the kindling project root?", dir)
+	}
+
+	// ── Create Kind cluster ─────────────────────────────────────
+	if skipCluster {
+		header("Skipping cluster creation (--skip-cluster)")
+	} else {
+		header("Creating Kind cluster")
+
+		if clusterExists(clusterName) {
+			warn(fmt.Sprintf("Cluster %q already exists — skipping creation", clusterName))
+		} else {
+			step("🔧", fmt.Sprintf("kind create cluster --name %s", clusterName))
+			if err := runDir(dir, "kind", "create", "cluster",
+				"--name", clusterName,
+				"--config", configPath,
+			); err != nil {
+				return fmt.Errorf("failed to create Kind cluster: %w", err)
+			}
+			success("Kind cluster created")
+		}
+	}
+
+	// ── Set kubectl context ─────────────────────────────────────
+	ctx := fmt.Sprintf("kind-%s", clusterName)
+	step("🔗", fmt.Sprintf("Switching kubectl context to %s", ctx))
+	if err := run("kubectl", "cluster-info", "--context", ctx); err != nil {
+		return fmt.Errorf("cannot reach cluster %q: %w", ctx, err)
+	}
+
+	// ── Setup ingress + registry ────────────────────────────────
+	header("Installing ingress-nginx + in-cluster registry")
+
+	ingressScript := filepath.Join(dir, "setup-ingress.sh")
+	if _, err := os.Stat(ingressScript); os.IsNotExist(err) {
+		return fmt.Errorf("setup-ingress.sh not found in %s", dir)
+	}
+
+	if err := runDir(dir, "bash", ingressScript); err != nil {
+		return fmt.Errorf("setup-ingress.sh failed: %w", err)
+	}
+	success("Ingress and registry ready")
+
+	// ── Build the operator image ────────────────────────────────
+	header("Building kindling operator image")
+
+	step("🏗️ ", "make docker-build IMG=controller:latest")
+	if err := runDir(dir, "make", "docker-build", "IMG=controller:latest"); err != nil {
+		return fmt.Errorf("operator image build failed: %w", err)
+	}
+	success("Operator image built")
+
+	// ── Load image into Kind ────────────────────────────────────
+	step("📦", "Loading image into Kind cluster")
+	if err := run("kind", "load", "docker-image", "controller:latest", "--name", clusterName); err != nil {
+		return fmt.Errorf("failed to load image into Kind: %w", err)
+	}
+	success("Image loaded")
+
+	// ── Install CRDs ────────────────────────────────────────────
+	header("Installing CRDs + deploying operator")
+
+	step("📜", "make install")
+	if err := runDir(dir, "make", "install"); err != nil {
+		return fmt.Errorf("CRD installation failed: %w", err)
+	}
+
+	// ── Deploy operator ─────────────────────────────────────────
+	step("🚀", "make deploy IMG=controller:latest")
+	if err := runDir(dir, "make", "deploy", "IMG=controller:latest"); err != nil {
+		return fmt.Errorf("operator deployment failed: %w", err)
+	}
+
+	// ── Wait for operator ───────────────────────────────────────
+	step("⏳", "Waiting for controller-manager rollout")
+	if err := run("kubectl", "rollout", "status",
+		"deployment/kindling-controller-manager",
+		"-n", "kindling-system",
+		"--timeout=120s",
+	); err != nil {
+		warn("Controller deployment rollout timed out — check with: kindling logs")
+	} else {
+		success("Controller is running")
+	}
+
+	// ── Done ────────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Printf("  %s🎉 kindling is ready!%s\n", colorGreen+colorBold, colorReset)
+	fmt.Println()
+	fmt.Println("  Next steps:")
+	fmt.Printf("    %skindling quickstart -u <github-user> -r <owner/repo> -t <pat>%s\n", colorCyan, colorReset)
+	fmt.Printf("    %skindling deploy -f examples/sample-app/dev-environment.yaml%s\n", colorCyan, colorReset)
+	fmt.Printf("    %skindling status%s\n", colorCyan, colorReset)
+	fmt.Println()
+
+	return nil
+}
