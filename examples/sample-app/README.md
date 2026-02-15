@@ -1,168 +1,187 @@
 # sample-app
 
-A tiny Go web server that demonstrates the full **kindling** developer loop —
-push code, build on your laptop, deploy to your local Kind cluster, hit it on
-localhost. Everything in this directory is designed to be **copied into your own
-repo** as a starting point.
+A tiny Go web server that demonstrates the full **kindling** developer
+loop in about 100 lines of code. It connects to Postgres and Redis
+(auto-provisioned by the operator) and exposes a few HTTP endpoints.
 
-## What's inside
+The goal is to show the shortest path from `git push` to a working app
+with real dependencies, running on your local Kind cluster.
+
+## What it does
 
 ```
-sample-app/
-├── .github/workflows/
-│   └── dev-deploy.yml       # GitHub Actions workflow (copy to your repo)
-├── main.go                  # Go web server (Postgres + Redis)
-├── Dockerfile               # Multi-stage Alpine build
-├── dev-environment.yaml     # DevStagingEnvironment CR (manual apply)
-├── go.mod / go.sum          # Go module
-└── README.md                # ← you are here
+ ┌──────────────┐       ┌───────────────┐       ┌──────────┐
+ │  sample-app  │──────▶│  PostgreSQL 16 │       │  Redis   │
+ │  :8080       │──────▶│  (auto)        │       │  (auto)  │
+ └──────┬───────┘       └───────────────┘       └──────────┘
+        │
+        ▼
+  GET /          → Hello message
+  GET /healthz   → Liveness probe
+  GET /status    → Postgres + Redis connectivity report
 ```
 
 | Endpoint | Description |
 |---|---|
-| `GET /` | Hello message |
-| `GET /healthz` | Liveness / readiness probe |
-| `GET /status` | Shows Postgres + Redis connectivity |
+| `GET /` | Friendly hello from the cluster |
+| `GET /healthz` | Always returns `{"status":"ok"}` |
+| `GET /status` | Pings Postgres and Redis, reports connectivity |
 
----
+## Files
 
-## Quick-start: Use this in your own project
+```
+sample-app/
+├── main.go                  # The app — ~100 lines of Go
+├── Dockerfile               # Two-stage build (golang:1.20 → alpine:3.19)
+├── go.mod                   # Go module
+├── dev-environment.yaml     # DevStagingEnvironment CR
+└── README.md                # ← you are here
+```
+
+## Quick-start
 
 ### Prerequisites
 
-Make sure you already have:
+- Local Kind cluster created with `kind-config.yaml`
+- **kindling** operator deployed ([Getting Started](../../README.md#getting-started))
+- `setup-ingress.sh` run (deploys registry + ingress-nginx)
 
-- A local Kind cluster running (`kind create cluster --name dev`)
-- The **kindling** operator deployed in the cluster ([Getting Started](../../README.md#getting-started))
-- A `GithubActionRunnerPool` CR applied with your GitHub username ([sample](../../config/samples/apps_v1alpha1_githubactionrunnerpool.yaml))
-- The runner pod is registered and idle (`kubectl get pods`)
+### Option A — Push to GitHub (CI flow)
 
-### Step 1 — Create a new GitHub repo
+If you have a `GithubActionRunnerPool` running, copy this example into
+your target repo and add a workflow that builds via the sidecar:
+
+```yaml
+# .github/workflows/dev-deploy.yml (simplified)
+name: Deploy sample-app
+on: push
+
+jobs:
+  deploy:
+    runs-on: [self-hosted]
+    steps:
+      # 1. Clean stale signal files
+      - run: rm -f /builds/*
+
+      # 2. Build image via Kaniko sidecar
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          TAG="${{ github.sha }}"
+          cd ${{ github.workspace }}
+          tar czf /builds/sample-app.tar.gz -C . .
+          echo "registry:5000/sample-app:${TAG}" > /builds/sample-app.dest
+          touch /builds/sample-app.request
+          echo "Waiting for Kaniko build..."
+          while [ ! -f /builds/sample-app.done ]; do sleep 2; done
+          echo "Build complete (exit code: $(cat /builds/sample-app.done))"
+
+      # 3. Deploy DSE CR via sidecar
+      - name: Deploy
+        run: |
+          ACTOR="${{ github.actor }}"
+          TAG="${{ github.sha }}"
+          cat > /builds/sample-app-dse.yaml <<EOF
+          apiVersion: apps.example.com/v1alpha1
+          kind: DevStagingEnvironment
+          metadata:
+            name: ${ACTOR}-sample-app
+          spec:
+            deployment:
+              image: registry:5000/sample-app:${TAG}
+              replicas: 1
+              port: 8080
+              healthCheck:
+                path: /healthz
+            service:
+              port: 8080
+              type: ClusterIP
+            ingress:
+              enabled: true
+              host: ${ACTOR}-sample-app.localhost
+              ingressClassName: nginx
+            dependencies:
+              - type: postgres
+                version: "16"
+              - type: redis
+          EOF
+          touch /builds/sample-app-dse.apply
+          while [ ! -f /builds/sample-app-dse.apply-done ]; do sleep 2; done
+          echo "Deploy complete"
+```
+
+Push your code and the runner handles everything — Kaniko builds the
+image, pushes to `registry:5000`, and the operator provisions Postgres,
+Redis, Deployment, Service, and Ingress.
+
+### Option B — Deploy manually (no GitHub)
 
 ```bash
-# Create a fresh repo (or use an existing one)
-mkdir my-app && cd my-app
-git init
-```
-
-### Step 2 — Copy the sample app files
-
-```bash
-# From the kindling repo root
-cp -r examples/sample-app/* my-app/
-cp -r examples/sample-app/.github my-app/
-```
-
-Your repo should now look like:
-
-```
-my-app/
-├── .github/workflows/dev-deploy.yml
-├── main.go
-├── Dockerfile
-├── dev-environment.yaml
-├── go.mod
-└── go.sum
-```
-
-### Step 3 — Configure your GitHub repo
-
-1. **Create a GitHub PAT** with `repo` scope (Settings → Developer settings → Personal access tokens).
-
-2. **Create the runner token Secret** on your Kind cluster (if you haven't already):
-
-   ```bash
-   kubectl create secret generic github-runner-token \
-     --from-literal=github-token=ghp_YOUR_TOKEN_HERE
-   ```
-
-3. **Update the `GithubActionRunnerPool` CR** with your repo slug:
-
-   ```yaml
-   spec:
-     githubUsername: "your-github-username"
-     repository: "your-org/my-app"          # ← your new repo
-   ```
-
-   ```bash
-   kubectl apply -f config/samples/apps_v1alpha1_githubactionrunnerpool.yaml
-   ```
-
-4. **Verify the runner is registered** — check the GitHub repo → Settings → Actions → Runners. You should see a runner with labels `[self-hosted, your-github-username]`.
-
-### Step 4 — Customize the workflow (optional)
-
-Open `.github/workflows/dev-deploy.yml` and tweak as needed:
-
-- **`APP_NAME`** — change from `sample-app` to your app's name
-- **`port`** — update if your app listens on a different port
-- **`healthCheck.path`** — update if your health endpoint differs
-- **`dependencies`** — add/remove services (postgres, redis, mysql, mongodb, rabbitmq, minio)
-
-### Step 5 — Push and watch it deploy
-
-```bash
-cd my-app
-git remote add origin git@github.com:your-org/my-app.git
-git add -A
-git commit -m "initial commit"
-git push -u origin main
-```
-
-Now watch the magic:
-
-1. GitHub receives the push and queues a workflow run
-2. Your local self-hosted runner picks it up (`runs-on: [self-hosted, your-username]`)
-3. The runner builds the Docker image using the host Docker socket
-4. The runner applies a `DevStagingEnvironment` CR to your Kind cluster
-5. The **kindling** operator reconciles: creates a Deployment, Service, Postgres, and Redis
-6. Connection URLs (`DATABASE_URL`, `REDIS_URL`) are auto-injected into your app
-
-### Step 6 — Verify
-
-```bash
-# Check everything came up
-kubectl get devstagingenvironments
-kubectl get pods
-
-# Port-forward and hit the app
-kubectl port-forward svc/<your-username>-dev 8080:8080
-curl http://localhost:8080/healthz
-curl http://localhost:8080/status | jq .
-```
-
-You should see both Postgres and Redis connected. 🎉
-
----
-
-## Deploying manually (without a GitHub Actions push)
-
-You can test the operator loop without pushing to GitHub:
-
-```bash
-# Build the image and load it into Kind
-docker build -t sample-app:dev .
+# 1. Build and load image into Kind
+docker build -t sample-app:dev examples/sample-app/
 kind load docker-image sample-app:dev --name dev
 
-# Apply the DevStagingEnvironment CR
-kubectl apply -f dev-environment.yaml
+# 2. Apply the DevStagingEnvironment CR
+kubectl apply -f examples/sample-app/dev-environment.yaml
 
-# Wait for rollout, then port-forward
+# 3. Wait for rollout
 kubectl rollout status deployment/sample-app-dev --timeout=120s
-kubectl port-forward svc/sample-app-dev 8080:8080
-
-# Hit the endpoints
-curl localhost:8080/healthz
-curl localhost:8080/status
 ```
 
----
+### Try it out
 
-## Running locally (outside the operator)
+With ingress-nginx running:
 
 ```bash
-go mod tidy
-DATABASE_URL="postgres://devuser:devpass@localhost:5432/devdb?sslmode=disable" \
-REDIS_URL="redis://localhost:6379/0" \
-go run .
+# Via Ingress (no port-forward needed)
+curl http://sample-app.localhost/
+curl http://sample-app.localhost/healthz
+curl http://sample-app.localhost/status | jq .
 ```
+
+<details>
+<summary><strong>Without Ingress (port-forward fallback)</strong></summary>
+
+```bash
+kubectl port-forward svc/sample-app-dev 8080:8080
+curl localhost:8080/status | jq .
+```
+
+</details>
+
+Expected `/status` output:
+
+```json
+{
+  "app": "sample-app",
+  "time": "2026-02-14T12:00:00Z",
+  "postgres": { "status": "connected" },
+  "redis": { "status": "connected" }
+}
+```
+
+## What the operator creates for you
+
+When you apply the `DevStagingEnvironment` CR, the kindling operator
+auto-provisions:
+
+| Resource | Description |
+|---|---|
+| **Deployment** | Your app container, configured with health checks |
+| **Service** (ClusterIP) | Internal routing to your app |
+| **Ingress** | `sample-app.localhost` → your app (via ingress-nginx) |
+| **Postgres 16** | Pod + Service, `DATABASE_URL` injected into your app |
+| **Redis** | Pod + Service, `REDIS_URL` injected into your app |
+
+You write zero infrastructure YAML for the backing services — just
+declare `dependencies: [{type: postgres}, {type: redis}]` and the
+operator handles the rest.
+
+## Cleaning up
+
+```bash
+kubectl delete devstagingenvironment sample-app-dev
+```
+
+The operator garbage-collects all owned resources (Deployment, Service,
+Ingress, Postgres pod, Redis pod) automatically.

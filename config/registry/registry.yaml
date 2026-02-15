@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────
+# In-cluster container image registry for Kaniko builds.
+#
+# Kaniko pods push images here via K8s DNS:  registry:5000/<image>:<tag>
+# Containerd on the Kind node pulls via the mirror configured in
+# kind-config.yaml:  localhost:5000  →  same registry pod (hostNetwork).
+# ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: default
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/component: image-registry
+    app.kubernetes.io/managed-by: kindling
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      # hostNetwork lets containerd on the node reach the registry at
+      # localhost:5000 without NodePort or extra networking.
+      hostNetwork: true
+      containers:
+        - name: registry
+          image: registry:2
+          ports:
+            - containerPort: 5000
+          volumeMounts:
+            - name: registry-data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: registry-data
+          emptyDir: {}
+---
+# ClusterIP Service so that Kaniko pods (which don't use hostNetwork)
+# can push to "registry:5000" via normal K8s DNS resolution.
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: default
+  labels:
+    app.kubernetes.io/name: registry
+    app.kubernetes.io/component: image-registry
+    app.kubernetes.io/managed-by: kindling
+spec:
+  selector:
+    app: registry
+  ports:
+    - port: 5000
+      targetPort: 5000

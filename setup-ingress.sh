@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
-# setup-ingress.sh — Install ingress-nginx on a Kind cluster
+# setup-ingress.sh — Install ingress-nginx and the in-cluster
+# image registry on a Kind cluster.
 #
-# This script deploys the ingress-nginx controller with the
-# Kind-specific patches so that it binds to the host ports
-# mapped in kind-config.yaml (80 → 80, 443 → 443).
+# This script:
+#   1. Deploys the ingress-nginx controller with Kind-specific
+#      patches so it binds to host ports 80/443.
+#   2. Deploys a registry:2 pod with hostNetwork so containerd
+#      (via the mirror in kind-config.yaml) and Kaniko pods can
+#      both reach it.
 #
 # Usage:
 #   ./setup-ingress.sh
@@ -15,6 +19,16 @@
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ── In-cluster image registry ──────────────────────────────────────
+echo "📦 Deploying in-cluster image registry..."
+kubectl apply -f config/registry/registry.yaml
+
+echo "⏳ Waiting for registry to be ready..."
+kubectl wait --for=condition=available deployment/registry --timeout=60s
+echo "✅ Registry is ready at registry:5000 (in-cluster)"
+
+# ── Ingress controller ────────────────────────────────────────────
+echo ""
 echo "📦 Installing ingress-nginx for Kind..."
 
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
@@ -31,8 +45,4 @@ echo ""
 echo "Your Kind cluster now routes:"
 echo "  http://<host>.localhost  →  Ingress → Service → Pod"
 echo ""
-echo "Configured hosts:"
-echo "  http://sample-app.localhost      → sample-app"
-echo "  http://gateway.localhost         → microservices gateway"
-echo "  http://orders.localhost          → microservices orders"
-echo "  http://inventory.localhost       → microservices inventory"
+echo "Image builds use Kaniko → registry:5000 (no Docker daemon needed)"

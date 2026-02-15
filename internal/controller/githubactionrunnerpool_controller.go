@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,8 +50,16 @@ const runnerPoolHashAnnotation = "apps.example.com/runner-pool-spec-hash"
 //+kubebuilder:rbac:groups=apps.example.com,resources=githubactionrunnerpools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=apps.example.com,resources=githubactionrunnerpools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=apps.example.com,resources=githubactionrunnerpools/finalizers,verbs=update
+//+kubebuilder:rbac:groups=apps.example.com,resources=devstagingenvironments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=apps,resources=replicasets;statefulsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=pods;pods/log;pods/exec;pods/attach;pods/portforward,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=services;configmaps,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind;escalate
 
 // Reconcile reads the state of the cluster for a GithubActionRunnerPool object and makes changes
 // to bring the cluster state closer to the desired state.
@@ -100,7 +109,20 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
-	// ── Step 4: Reconcile the runner Deployment ────────────────────────
+	// ── Step 4: Reconcile RBAC for the runner pod ──────────────────────
+	// The runner pod needs kubectl access to create Kaniko pods, apply CRs, etc.
+	if err := r.reconcileRunnerRBAC(ctx, cr); err != nil {
+		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
+			Type:    "Ready",
+			Status:  metav1.ConditionFalse,
+			Reason:  "RBACFailed",
+			Message: fmt.Sprintf("Failed to reconcile runner RBAC: %v", err),
+		})
+		_ = r.Status().Update(ctx, cr)
+		return ctrl.Result{}, err
+	}
+
+	// ── Step 5: Reconcile the runner Deployment ────────────────────────
 	if err := r.reconcileRunnerDeployment(ctx, cr); err != nil {
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "DeploymentReady",
@@ -112,13 +134,162 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
-	// ── Step 5: Update status ──────────────────────────────────────────
+	// ── Step 6: Update status ──────────────────────────────────────────
 	if err := r.updateRunnerPoolStatus(ctx, cr); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	logger.Info("Reconciliation complete for runner pool")
 	return ctrl.Result{}, nil
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Runner RBAC — ServiceAccount, ClusterRole, ClusterRoleBinding
+// ────────────────────────────────────────────────────────────────────────────
+
+// reconcileRunnerRBAC ensures the runner pod has a ServiceAccount with the
+// permissions it needs: creating Kaniko pods, applying DevStagingEnvironment
+// CRs, watching rollouts, port-forwarding, etc.
+func (r *GithubActionRunnerPoolReconciler) reconcileRunnerRBAC(ctx context.Context, cr *appsv1alpha1.GithubActionRunnerPool) error {
+	logger := log.FromContext(ctx)
+
+	saName := runnerServiceAccountName(cr)
+	crName := runnerClusterRoleName(cr)
+	crbName := runnerClusterRoleBindingName(cr)
+
+	// ── ServiceAccount ────────────────────────────────────────────────
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: cr.Namespace,
+			Labels:    labelsForRunnerPool(cr),
+		},
+	}
+	if err := controllerutil.SetControllerReference(cr, sa, r.Scheme); err != nil {
+		return err
+	}
+	existingSA := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, types.NamespacedName{Name: saName, Namespace: cr.Namespace}, existingSA); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating runner ServiceAccount", "name", saName)
+			if err := r.Create(ctx, sa); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	// ── ClusterRole ───────────────────────────────────────────────────
+	// The runner needs broad access: it runs Kaniko pods, applies CRDs,
+	// monitors rollouts, and port-forwards for smoke tests.
+	clusterRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   crName,
+			Labels: labelsForRunnerPool(cr),
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				// Kaniko pods + watching/debugging workloads
+				APIGroups: []string{""},
+				Resources: []string{"pods", "pods/log", "pods/exec", "pods/attach", "pods/portforward", "services", "configmaps", "secrets"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// Deployments, ReplicaSets for rollout status
+				APIGroups: []string{"apps"},
+				Resources: []string{"deployments", "replicasets", "statefulsets"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// DevStagingEnvironment CRs
+				APIGroups: []string{"apps.example.com"},
+				Resources: []string{"devstagingenvironments", "githubactionrunnerpools"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// Ingresses for the UI
+				APIGroups: []string{"networking.k8s.io"},
+				Resources: []string{"ingresses"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// Events for debugging
+				APIGroups: []string{""},
+				Resources: []string{"events"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+		},
+	}
+	existingCR := &rbacv1.ClusterRole{}
+	if err := r.Get(ctx, types.NamespacedName{Name: crName}, existingCR); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating runner ClusterRole", "name", crName)
+			if err := r.Create(ctx, clusterRole); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		existingCR.Rules = clusterRole.Rules
+		existingCR.Labels = clusterRole.Labels
+		if err := r.Update(ctx, existingCR); err != nil {
+			return err
+		}
+	}
+
+	// ── ClusterRoleBinding ────────────────────────────────────────────
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   crbName,
+			Labels: labelsForRunnerPool(cr),
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: cr.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     crName,
+		},
+	}
+	existingCRB := &rbacv1.ClusterRoleBinding{}
+	if err := r.Get(ctx, types.NamespacedName{Name: crbName}, existingCRB); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating runner ClusterRoleBinding", "name", crbName)
+			if err := r.Create(ctx, crb); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		existingCRB.Subjects = crb.Subjects
+		existingCRB.RoleRef = crb.RoleRef
+		existingCRB.Labels = crb.Labels
+		if err := r.Update(ctx, existingCRB); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func runnerServiceAccountName(cr *appsv1alpha1.GithubActionRunnerPool) string {
+	return fmt.Sprintf("%s-runner", cr.Spec.GitHubUsername)
+}
+
+func runnerClusterRoleName(cr *appsv1alpha1.GithubActionRunnerPool) string {
+	return fmt.Sprintf("%s-runner", cr.Spec.GitHubUsername)
+}
+
+func runnerClusterRoleBindingName(cr *appsv1alpha1.GithubActionRunnerPool) string {
+	return fmt.Sprintf("%s-runner", cr.Spec.GitHubUsername)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -170,6 +341,20 @@ func (r *GithubActionRunnerPoolReconciler) buildRunnerDeployment(cr *appsv1alpha
 		replicas = *spec.Replicas
 	}
 
+	// Default work directory — must be under /home/runner (the runner user's
+	// home in the official actions-runner image) so the non-root process can
+	// create it at runtime.
+	workDir := spec.WorkDir
+	if workDir == "" || workDir == "/runner/_work" {
+		workDir = "/home/runner/_work"
+	}
+
+	// Default service account — use the auto-created one if not specified
+	saName := spec.ServiceAccountName
+	if saName == "" {
+		saName = runnerServiceAccountName(cr)
+	}
+
 	githubURL := spec.GitHubURL
 	if githubURL == "" {
 		githubURL = "https://github.com"
@@ -198,7 +383,7 @@ func (r *GithubActionRunnerPoolReconciler) buildRunnerDeployment(cr *appsv1alpha
 		},
 		{
 			Name:  "RUNNER_WORKDIR",
-			Value: spec.WorkDir,
+			Value: workDir,
 		},
 		{
 			// Repository URL for runner registration
@@ -326,85 +511,154 @@ exec ./run.sh
 `
 
 	container := corev1.Container{
-		Name:         "runner",
-		Image:        runnerImage,
-		Command:      []string{"/bin/bash", "-c", startupScript},
-		Env:          env,
-		VolumeMounts: spec.VolumeMounts,
+		Name:    "runner",
+		Image:   runnerImage,
+		Command: []string{"/bin/bash", "-c", startupScript},
+		Env:     env,
+		VolumeMounts: append([]corev1.VolumeMount{
+			{
+				Name:      "builds",
+				MountPath: "/builds",
+			},
+		}, spec.VolumeMounts...),
 	}
 
 	if spec.Resources != nil {
 		container.Resources = buildRunnerResourceRequirements(spec.Resources)
 	}
 
+	// ── Build-agent sidecar ───────────────────────────────────────────
+	// This sidecar has kubectl pre-installed and watches /builds for build
+	// requests. The GH Actions workflow writes tarballs + trigger files
+	// there; the sidecar pipes them into one-shot Kaniko executor pods.
+	// No permissions juggling in the runner container required.
+	buildAgentScript := `#!/bin/bash
+set -uo pipefail
+
+BUILDS_DIR=/builds
+echo "🔧 Build-agent sidecar ready, watching ${BUILDS_DIR}..."
+
+while true; do
+  # ── Handle image build requests (.request) ─────────────────────
+  for req in ${BUILDS_DIR}/*.request; do
+    [ -f "$req" ] || continue
+    SERVICE="$(basename "$req" .request)"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📦 Build request: ${SERVICE}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    DEST=$(cat "${BUILDS_DIR}/${SERVICE}.dest")
+    echo "   destination: ${DEST}"
+
+    mv "$req" "${req}.processing"
+
+    kubectl delete pod "kaniko-${SERVICE}" 2>/dev/null || true
+
+    echo "   launching kaniko pod..."
+    cat "${BUILDS_DIR}/${SERVICE}.tar.gz" | kubectl run "kaniko-${SERVICE}" \
+      --rm -i --restart=Never \
+      --image=gcr.io/kaniko-project/executor:latest \
+      -- --context=tar://stdin \
+         --destination="${DEST}" \
+         --insecure \
+         --cache=false \
+      > "${BUILDS_DIR}/${SERVICE}.log" 2>&1
+    EXIT_CODE=$?
+
+    echo "${EXIT_CODE}" > "${BUILDS_DIR}/${SERVICE}.exitcode"
+    touch "${BUILDS_DIR}/${SERVICE}.done"
+    rm -f "${req}.processing"
+
+    if [ ${EXIT_CODE} -eq 0 ]; then
+      echo "   ✅ ${SERVICE} → ${DEST}"
+    else
+      echo "   ❌ ${SERVICE} build failed (exit ${EXIT_CODE}):"
+      tail -20 "${BUILDS_DIR}/${SERVICE}.log"
+    fi
+  done
+
+  # ── Handle kubectl apply requests (.apply) ─────────────────────
+  for req in ${BUILDS_DIR}/*.apply; do
+    [ -f "$req" ] || continue
+    NAME="$(basename "$req" .apply)"
+    echo ""
+    echo "📋 Apply request: ${NAME}"
+
+    mv "$req" "${req}.processing"
+
+    kubectl apply -f "${BUILDS_DIR}/${NAME}.yaml" \
+      > "${BUILDS_DIR}/${NAME}.apply-log" 2>&1
+    EXIT_CODE=$?
+
+    echo "${EXIT_CODE}" > "${BUILDS_DIR}/${NAME}.apply-exitcode"
+    touch "${BUILDS_DIR}/${NAME}.apply-done"
+    rm -f "${req}.processing"
+
+    if [ ${EXIT_CODE} -eq 0 ]; then
+      echo "   ✅ ${NAME} applied"
+    else
+      echo "   ❌ ${NAME} apply failed (exit ${EXIT_CODE}):"
+      cat "${BUILDS_DIR}/${NAME}.apply-log"
+    fi
+  done
+
+  # ── Handle kubectl exec requests (.kubectl) ────────────────────
+  for req in ${BUILDS_DIR}/*.kubectl; do
+    [ -f "$req" ] || continue
+    NAME="$(basename "$req" .kubectl)"
+    echo ""
+    echo "🔧 kubectl request: ${NAME}"
+
+    mv "$req" "${req}.processing"
+
+    bash "${BUILDS_DIR}/${NAME}.sh" \
+      > "${BUILDS_DIR}/${NAME}.kubectl-log" 2>&1
+    EXIT_CODE=$?
+
+    echo "${EXIT_CODE}" > "${BUILDS_DIR}/${NAME}.kubectl-exitcode"
+    touch "${BUILDS_DIR}/${NAME}.kubectl-done"
+    rm -f "${req}.processing"
+
+    if [ ${EXIT_CODE} -eq 0 ]; then
+      echo "   ✅ ${NAME} completed"
+    else
+      echo "   ❌ ${NAME} failed (exit ${EXIT_CODE}):"
+      cat "${BUILDS_DIR}/${NAME}.kubectl-log"
+    fi
+  done
+
+  sleep 1
+done
+`
+
+	buildAgent := corev1.Container{
+		Name:    "build-agent",
+		Image:   "bitnami/kubectl:latest",
+		Command: []string{"/bin/bash", "-c", buildAgentScript},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "builds",
+				MountPath: "/builds",
+			},
+		},
+	}
+
 	// ── Build the pod spec (single-node Kind, no anti-affinity needed) ─
+	// The runner container handles GH Actions jobs. The build-agent
+	// sidecar handles all kubectl/Kaniko work via a shared /builds volume.
 	podSpec := corev1.PodSpec{
-		Containers:                    []corev1.Container{container},
-		ServiceAccountName:            spec.ServiceAccountName,
-		Volumes:                       append([]corev1.Volume{}, spec.Volumes...),
-		TerminationGracePeriodSeconds: int64Ptr(30),
-	}
-
-	// ── Docker mode: socket (default), dind, or none ──────────────────
-	dockerMode := spec.DockerMode
-	if dockerMode == "" {
-		dockerMode = appsv1alpha1.DockerModeSocket
-	}
-
-	switch dockerMode {
-	case appsv1alpha1.DockerModeSocket:
-		// Mount the host Docker socket — lightest weight approach for local Kind.
-		// Images built here land directly on the host Docker, where `kind load`
-		// pulls from, and benefit from the host's layer cache.
-		podSpec.Containers[0].Env = append(podSpec.Containers[0].Env, corev1.EnvVar{
-			Name:  "DOCKER_HOST",
-			Value: "unix:///var/run/docker.sock",
-		})
-		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts, corev1.VolumeMount{
-			Name:      "docker-socket",
-			MountPath: "/var/run/docker.sock",
-		})
-		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
-			Name: "docker-socket",
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{
-					Path: "/var/run/docker.sock",
+		Containers:                    []corev1.Container{container, buildAgent},
+		ServiceAccountName:            saName,
+		Volumes: append([]corev1.Volume{
+			{
+				Name: "builds",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
 			},
-		})
-
-	case appsv1alpha1.DockerModeDinD:
-		// Docker-in-Docker sidecar — fully isolated, but needs a privileged
-		// container and burns more memory. No layer caching between restarts.
-		dindContainer := corev1.Container{
-			Name:  "dind",
-			Image: "docker:dind",
-			SecurityContext: &corev1.SecurityContext{
-				Privileged: boolPtr(true),
-			},
-			Env: []corev1.EnvVar{
-				{Name: "DOCKER_TLS_CERTDIR", Value: ""},
-			},
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: "dind-storage", MountPath: "/var/lib/docker"},
-			},
-		}
-		podSpec.Containers = append(podSpec.Containers, dindContainer)
-
-		podSpec.Containers[0].Env = append(podSpec.Containers[0].Env, corev1.EnvVar{
-			Name:  "DOCKER_HOST",
-			Value: "tcp://localhost:2375",
-		})
-
-		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
-			Name: "dind-storage",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		})
-
-	case appsv1alpha1.DockerModeNone:
-		// No Docker access — runner only runs non-build jobs or uses external builds.
+		}, spec.Volumes...),
+		TerminationGracePeriodSeconds: int64Ptr(30),
 	}
 
 	// Name the deployment after the username so it's obvious in `kubectl get deploy`
@@ -520,10 +774,6 @@ func computeRunnerPoolHash(obj interface{}) string {
 }
 
 func int64Ptr(v int64) *int64 {
-	return &v
-}
-
-func boolPtr(v bool) *bool {
 	return &v
 }
 

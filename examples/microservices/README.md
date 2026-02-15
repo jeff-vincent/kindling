@@ -12,7 +12,7 @@ flowchart LR
     user(("👩‍💻 Developer"))
 
     subgraph cluster["⎈  Kind Cluster"]
-        ingress["🔶 Ingress\ngateway.localhost"]
+        ingress["🔶 Ingress\n<username>-ui.localhost"]
         gw["🌐 Gateway\n:8080"]
 
         subgraph orders-stack["Orders Stack"]
@@ -35,7 +35,7 @@ flowchart LR
         inv -- "reads/writes" --> mongo
     end
 
-    user -- "http://gateway.localhost" --> ingress
+    user -- "http://<user>-ui.localhost" --> ingress
 
     style cluster fill:#0f3460,stroke:#326CE5,color:#e0e0e0,stroke-width:2px
     style orders-stack fill:#1a1a2e,stroke:#f0883e,color:#e0e0e0
@@ -71,7 +71,7 @@ flowchart LR
 ```
 microservices/
 ├── .github/workflows/
-│   └── dev-deploy.yml          # GH Actions: build all 4 images + deploy
+│   └── dev-deploy.yml          # GH Actions: build all 4 images + deploy via sidecar
 ├── gateway/
 │   ├── main.go                 # Reverse-proxy HTTP server
 │   ├── Dockerfile              # Multi-stage build
@@ -96,6 +96,22 @@ microservices/
 │   └── ui.yaml                 # DevStagingEnvironment CR (React UI)
 └── README.md                   # ← you are here
 ```
+
+## How image builds work
+
+This demo uses **Kaniko** for container image builds — no Docker daemon needed.
+
+The runner pod has a **build-agent sidecar** (see [root README](../../README.md#how-the-build-agent-sidecar-works)) that watches the shared `/builds` volume. The workflow:
+
+1. **Tars** each service's build context → `/builds/<svc>.tar.gz`
+2. **Writes** the image destination → `/builds/<svc>.dest` (e.g. `registry:5000/ms-orders:<tag>`)
+3. **Touches** the trigger → `/builds/<svc>.request`
+4. The sidecar launches a **Kaniko pod** that reads the tarball via stdin, builds the image, and pushes it to the in-cluster registry at `registry:5000`
+5. The sidecar signals completion via `/builds/<svc>.done`
+
+Deploy steps work similarly — the workflow writes YAML to `/builds/<name>.yaml` and touches `/builds/<name>.apply`. The sidecar runs `kubectl apply -f` and signals with `/builds/<name>.apply-done`.
+
+> **Important:** The workflow starts with a cleanup step (`rm -f /builds/*`) to clear stale signal files from any previous run, since the `/builds` emptyDir persists for the life of the pod.
 
 ## Endpoints
 
@@ -133,38 +149,14 @@ microservices/
 
 ### Prerequisites
 
-- Local Kind cluster (`kind create cluster --name dev`)
+- Local Kind cluster created with `kind-config.yaml` (for registry mirror + Ingress ports)
 - **kindling** operator deployed ([Getting Started](../../README.md#getting-started))
-- `GithubActionRunnerPool` CR applied with your GitHub username (PAT is auto-exchanged for a registration token — see [Token Exchange](../../README.md#3-create-the-github-token-secret))
+- `setup-ingress.sh` run (deploys registry + ingress-nginx)
+- `GithubActionRunnerPool` CR applied with your GitHub username
 
-### Option A — Deploy manually (no GitHub push)
+### Option A — Push to GitHub (recommended)
 
-```bash
-# Build and load images into Kind
-docker build -t ms-gateway:dev   gateway/
-docker build -t ms-orders:dev    orders/
-docker build -t ms-inventory:dev inventory/
-docker build -t ms-ui:dev        ui/
-
-kind load docker-image ms-gateway:dev   --name dev
-kind load docker-image ms-orders:dev    --name dev
-kind load docker-image ms-inventory:dev --name dev
-kind load docker-image ms-ui:dev        --name dev
-
-# Apply the DevStagingEnvironment CRs (order matters: deps first)
-kubectl apply -f deploy/orders.yaml
-kubectl apply -f deploy/inventory.yaml
-kubectl apply -f deploy/gateway.yaml
-kubectl apply -f deploy/ui.yaml
-
-# Wait for everything to come up
-kubectl rollout status deployment/microservices-orders-dev    --timeout=120s
-kubectl rollout status deployment/microservices-inventory-dev --timeout=120s
-kubectl rollout status deployment/microservices-gateway-dev   --timeout=120s
-kubectl rollout status deployment/microservices-ui-dev        --timeout=120s
-```
-
-### Option B — Copy into a repo and push
+Copy the microservices directory into a repo that your runner pool targets:
 
 ```bash
 mkdir my-microservices && cd my-microservices && git init
@@ -175,47 +167,63 @@ git remote add origin git@github.com:your-org/my-microservices.git
 git add -A && git commit -m "initial commit" && git push -u origin main
 ```
 
-Your local runner picks up the workflow, builds all four images, and
-applies the CRs. The kindling operator provisions Postgres, MongoDB,
-and Redis automatically.
+Your local runner picks up the workflow, builds all four images via Kaniko,
+pushes them to `registry:5000`, and applies the DevStagingEnvironment CRs.
+The kindling operator provisions Postgres, MongoDB, and Redis automatically.
+
+### Option B — Deploy manually (no GitHub push)
+
+You can build and load images directly using Docker and Kind:
+
+```bash
+# Build and load images into Kind
+for svc in gateway orders inventory ui; do
+  docker build -t registry:5000/ms-${svc}:dev examples/microservices/${svc}/
+  kind load docker-image registry:5000/ms-${svc}:dev --name dev
+done
+
+# Apply the DevStagingEnvironment CRs
+kubectl apply -f deploy/orders.yaml
+kubectl apply -f deploy/inventory.yaml
+kubectl apply -f deploy/gateway.yaml
+kubectl apply -f deploy/ui.yaml
+
+# Wait for everything to come up
+for svc in orders inventory gateway ui; do
+  kubectl rollout status deployment/<your-username>-${svc} --timeout=120s
+done
+```
 
 ### Try it out
 
-With ingress-nginx installed (see [setup-ingress.sh](../../setup-ingress.sh)), open
-the **React dashboard** — no port-forwarding needed:
+With ingress-nginx running, open the **React dashboard** — no port-forwarding needed:
 
 ```
-🎨  http://ui.localhost        ← Dashboard (place orders, view inventory, activity log)
-🌐  http://gateway.localhost   ← Gateway API
-📋  http://orders.localhost    ← Orders API (direct)
-📦  http://inventory.localhost ← Inventory API (direct)
+🎨  http://<your-username>-ui.localhost        ← Dashboard
+🌐  http://<your-username>-gateway.localhost   ← Gateway API (if ingress configured)
 ```
 
 Or use curl against the gateway:
 
 ```bash
 # Check everything is healthy
-curl http://gateway.localhost/status | jq .
+curl -H "Host: <your-username>-gateway.localhost" http://localhost/status | jq .
 
 # Create an order
-curl -X POST http://gateway.localhost/orders \
+curl -X POST -H "Host: <your-username>-gateway.localhost" http://localhost/orders \
   -H "Content-Type: application/json" \
   -d '{"product":"widget-a","quantity":3}' | jq .
 
 # Wait a moment for the queue consumer, then check inventory
 sleep 2
-curl http://gateway.localhost/inventory | jq .
-
-# You can also hit the backend services directly for debugging:
-curl http://orders.localhost/status | jq .
-curl http://inventory.localhost/status | jq .
+curl -H "Host: <your-username>-gateway.localhost" http://localhost/inventory | jq .
 ```
 
 <details>
 <summary><strong>Without Ingress (port-forward fallback)</strong></summary>
 
 ```bash
-kubectl port-forward svc/microservices-gateway-dev 8080:8080
+kubectl port-forward svc/<your-username>-gateway 8080:8080
 curl localhost:8080/status | jq .
 ```
 
@@ -241,12 +249,12 @@ inventory service's CR overrides its `REDIS_URL` env var to point at the
 orders service's Redis:
 
 ```yaml
-# inventory.yaml
+# inventory DevStagingEnvironment
 spec:
   deployment:
     env:
       - name: REDIS_URL
-        value: "redis://microservices-orders-dev-redis:6379/0"
+        value: "redis://<username>-orders-redis:6379/0"
 ```
 
 The queue protocol is simple:
@@ -271,11 +279,7 @@ Event payload:
 ## Cleaning up
 
 ```bash
-kubectl delete devstagingenvironments \
-  microservices-ui-dev \
-  microservices-gateway-dev \
-  microservices-orders-dev \
-  microservices-inventory-dev
+kubectl delete devstagingenvironments -l app.kubernetes.io/part-of=microservices-demo
 ```
 
 The operator garbage-collects all owned Deployments, Services, and

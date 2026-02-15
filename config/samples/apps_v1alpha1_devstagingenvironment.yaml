@@ -1,20 +1,122 @@
+# ── Orders Service ──────────────────────────────────────────────────
+# Postgres 16 for order storage, Redis queue for publishing events.
+# The operator auto-provisions both and injects DATABASE_URL + REDIS_URL.
 apiVersion: apps.example.com/v1alpha1
 kind: DevStagingEnvironment
 metadata:
-  name: sample-app
+  name: microservices-orders-dev
+  labels:
+    app.kubernetes.io/component: orders
+    app.kubernetes.io/managed-by: kindling
+    app.kubernetes.io/part-of: microservices-demo
 spec:
   deployment:
-    image: nginx:1.25
+    image: ms-orders:dev
     replicas: 1
-    port: 80
+    port: 8081
+    healthCheck:
+      path: /healthz
   service:
-    port: 80
+    port: 8081
     type: ClusterIP
-
-  # ── Dependencies ──────────────────────────────────────────────────
-  # The operator auto-provisions each service and injects connection
-  # env vars (DATABASE_URL, REDIS_URL, etc.) into the app container.
+  ingress:
+    enabled: true
+    host: orders.localhost
+    ingressClassName: nginx
   dependencies:
     - type: postgres
       version: "16"
     - type: redis
+
+---
+# ── Inventory Service ──────────────────────────────────────────────
+# MongoDB for product stock. Consumes order.created events from
+# the Orders service's Redis queue (cross-service dependency).
+apiVersion: apps.example.com/v1alpha1
+kind: DevStagingEnvironment
+metadata:
+  name: microservices-inventory-dev
+  labels:
+    app.kubernetes.io/component: inventory
+    app.kubernetes.io/managed-by: kindling
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  deployment:
+    image: ms-inventory:dev
+    replicas: 1
+    port: 8082
+    env:
+      - name: REDIS_URL
+        value: "redis://microservices-orders-dev-redis:6379/0"
+    healthCheck:
+      path: /healthz
+  service:
+    port: 8082
+    type: ClusterIP
+  ingress:
+    enabled: true
+    host: inventory.localhost
+    ingressClassName: nginx
+  dependencies:
+    - type: mongodb
+
+---
+# ── Gateway ────────────────────────────────────────────────────────
+# Reverse-proxy entry point. Routes /orders and /inventory to the
+# backend services.
+apiVersion: apps.example.com/v1alpha1
+kind: DevStagingEnvironment
+metadata:
+  name: microservices-gateway-dev
+  labels:
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/managed-by: kindling
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  deployment:
+    image: ms-gateway:dev
+    replicas: 1
+    port: 8080
+    env:
+      - name: ORDERS_SERVICE_URL
+        value: "http://microservices-orders-dev:8081"
+      - name: INVENTORY_SERVICE_URL
+        value: "http://microservices-inventory-dev:8082"
+    healthCheck:
+      path: /healthz
+  service:
+    port: 8080
+    type: ClusterIP
+  ingress:
+    enabled: true
+    host: gateway.localhost
+    ingressClassName: nginx
+
+---
+# ── UI Dashboard ───────────────────────────────────────────────────
+# React + TypeScript dashboard served by nginx. Proxies /api/* to
+# the gateway service.
+apiVersion: apps.example.com/v1alpha1
+kind: DevStagingEnvironment
+metadata:
+  name: microservices-ui-dev
+  labels:
+    app.kubernetes.io/component: ui
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  deployment:
+    image: ms-ui:dev
+    replicas: 1
+    port: 80
+    env:
+      - name: GATEWAY_URL
+        value: "http://microservices-gateway-dev:8080"
+    healthCheck:
+      path: /
+  service:
+    port: 80
+    type: ClusterIP
+  ingress:
+    enabled: true
+    host: ui.localhost
+    ingressClassName: nginx

@@ -23,7 +23,7 @@ Most teams pay for cloud CI runners that:
 
 **What if the runner was already on your laptop?**
 
-`kindling` flips the model. Each developer runs a lightweight Kind cluster. Inside it, a self-hosted GitHub Actions runner polls for CI jobs triggered by *their* pushes. When a job arrives, the runner builds the container using the host Docker socket (the same daemon Kind itself uses), then the operator deploys the result as a full staging environment — Deployment, Service, and optional Ingress — right on localhost.
+`kindling` flips the model. Each developer runs a lightweight Kind cluster. Inside it, a self-hosted GitHub Actions runner polls for CI jobs triggered by *their* pushes. When a job arrives, the runner builds containers using **Kaniko** (no Docker daemon required) and pushes them to an **in-cluster registry**. The operator then deploys the result as a full staging environment — Deployment, Service, and optional Ingress — right on localhost.
 
 ```mermaid
 flowchart TB
@@ -36,20 +36,24 @@ flowchart TB
     subgraph machine["🖥️  Developer's Machine"]
         subgraph kind["☸  Kind Cluster"]
             controller("🔥 kindling\ncontroller")
-            runner("🏃 GithubActionRunnerPool\n<i>runner pod + Docker socket</i>")
+            runner("🏃 Runner Pod\n<i>runner + build-agent sidecar</i>")
+            registry("📦 registry:5000\n<i>in-cluster</i>")
             staging("📦 DevStagingEnv\n<i>Deployment + Service + Ingress</i>")
 
+            runner -- "Kaniko builds\n→ registry:5000" --> registry
+            registry -- "image pull" --> staging
             controller -- "creates &\nreconciles" --> staging
-            runner -- "polls GH, builds app,\napplies CR" --> staging
+            runner -- "applies CR" --> controller
         end
     end
 
-    staging -. "localhost:8080" .-> dev
+    staging -. "localhost:80\n(via Ingress)" .-> dev
 
     style machine fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
     style kind fill:#0f3460,stroke:#326CE5,color:#e0e0e0,stroke-width:2px
     style controller fill:#FF6B35,stroke:#FF6B35,color:#fff
     style runner fill:#2ea043,stroke:#2ea043,color:#fff
+    style registry fill:#0db7ed,stroke:#0db7ed,color:#fff
     style staging fill:#326CE5,stroke:#326CE5,color:#fff
     style dev fill:#6e40c9,stroke:#6e40c9,color:#fff
     style gh fill:#24292f,stroke:#24292f,color:#fff
@@ -63,7 +67,12 @@ The operator manages two CRDs in the `apps.example.com/v1alpha1` group:
 
 ### `GithubActionRunnerPool`
 
-Declares a self-hosted runner pool bound to a **single developer** and a **single GitHub repository**. The operator creates a Deployment running the [official GitHub Actions runner image](https://github.com/actions/runner) with access to the host Docker socket (or an optional DinD sidecar). At startup each runner pod **automatically exchanges** the stored PAT for a short-lived registration token via the GitHub API, then registers with GitHub using the developer's username as a runner label. On shutdown a removal token is obtained to cleanly de-register.
+Declares a self-hosted runner pool bound to a **single developer** and a **single GitHub repository**. The operator creates a Deployment with two containers:
+
+1. **Runner** — the [official GitHub Actions runner image](https://github.com/actions/runner). Exchanges the stored PAT for a short-lived registration token at startup, registers with GitHub using the developer's username as a label, and cleanly de-registers on shutdown.
+2. **Build-agent sidecar** — a `bitnami/kubectl` container that watches a shared `/builds` volume for build and deploy requests. It runs Kaniko pods for image builds and `kubectl apply` for deployments, keeping the runner container stock and unprivileged.
+
+The operator also **auto-provisions RBAC** (ServiceAccount, ClusterRole, ClusterRoleBinding) for each runner pool — no manual SA setup required.
 
 ```yaml
 apiVersion: apps.example.com/v1alpha1
@@ -71,14 +80,12 @@ kind: GithubActionRunnerPool
 metadata:
   name: jeff-runner-pool
 spec:
-  githubUsername: "jeffvincent"              # routes jobs to this dev's cluster
-  repository: "myorg/myrepo"                 # repo to poll for workflow runs
+  githubUsername: "jeff-vincent"              # routes jobs to this dev's cluster
+  repository: "jeff-vincent/demo-kindling"   # repo to poll for workflow runs
   tokenSecretRef:
     name: github-runner-token                # Secret holding a GitHub PAT (repo scope)
   replicas: 1                                # one runner per developer
-  dockerMode: socket                         # socket (default) | dind | none
-  serviceAccountName: runner-deployer        # needs RBAC to create DevStagingEnvironments
-  labels: [linux, x64]                       # extra runner labels
+  labels: [linux]                            # extra runner labels
   resources:
     cpuRequest: "500m"
     memoryLimit: "4Gi"
@@ -94,26 +101,43 @@ on: push
 jobs:
   build-and-deploy:
     runs-on: [self-hosted, "${{ github.actor }}"]
+
+    env:
+      TAG: "${{ github.actor }}-${{ github.sha }}"
+      REGISTRY: "registry:5000"
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build container image
-        run: docker build -t myapp:${{ github.sha }} .
+      # Clean stale signal files from previous runs
+      - name: Clean builds directory
+        run: rm -f /builds/*
 
+      # Build via the sidecar — write tarball + trigger, wait for done
+      - name: Build container image
+        run: |
+          tar -czf /builds/myapp.tar.gz -C . .
+          echo "$REGISTRY/myapp:$TAG" > /builds/myapp.dest
+          touch /builds/myapp.request
+          while [ ! -f /builds/myapp.done ]; do sleep 2; done
+
+      # Deploy via the sidecar — write YAML + trigger, wait for done
       - name: Deploy to local Kind cluster
         run: |
-          kubectl apply -f - <<EOF
+          cat > /builds/myapp.yaml <<EOF
           apiVersion: apps.example.com/v1alpha1
           kind: DevStagingEnvironment
           metadata:
             name: ${{ github.actor }}-dev
           spec:
             deployment:
-              image: myapp:${{ github.sha }}
+              image: $REGISTRY/myapp:$TAG
               port: 8080
             service:
               port: 8080
           EOF
+          touch /builds/myapp.apply
+          while [ ! -f /builds/myapp.apply-done ]; do sleep 1; done
 ```
 
 <details>
@@ -126,18 +150,45 @@ jobs:
 | `tokenSecretRef` | *(required)* | Reference to a Secret holding a GitHub PAT (`repo` scope). The runner auto-exchanges it for a short-lived registration token at startup. |
 | `replicas` | `1` | Number of runner pods |
 | `runnerImage` | `ghcr.io/actions/actions-runner:latest` | Runner container image |
-| `dockerMode` | `socket` | Docker strategy: `socket` (host mount, lightest), `dind` (sidecar), or `none` |
 | `labels` | `[]` | Extra runner labels (`self-hosted` + username always added) |
 | `runnerGroup` | `"Default"` | GitHub runner group |
 | `resources` | `nil` | CPU/memory requests and limits |
-| `serviceAccountName` | `""` | SA for the runner pod (needs DevStagingEnv RBAC) |
-| `workDir` | `/runner/_work` | Runner working directory |
+| `serviceAccountName` | `""` | SA for the runner pod (auto-created if empty) |
+| `workDir` | `/home/runner/_work` | Runner working directory |
 | `githubURL` | `https://github.com` | Override for GitHub Enterprise Server |
 | `env` | `[]` | Extra environment variables |
 | `volumeMounts` | `[]` | Additional volume mounts |
 | `volumes` | `[]` | Additional volumes |
 
 </details>
+
+### How the build-agent sidecar works
+
+The runner pod contains two containers sharing a `/builds` emptyDir volume:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Runner Pod                                              │
+│                                                         │
+│  ┌─────────────────┐   /builds   ┌───────────────────┐  │
+│  │ runner           │◄──────────►│ build-agent        │  │
+│  │ (GH Actions)     │  emptyDir  │ (bitnami/kubectl)  │  │
+│  │                  │            │                    │  │
+│  │ writes:          │            │ watches for:       │  │
+│  │  *.tar.gz + .dest│            │  .request → Kaniko │  │
+│  │  *.yaml          │            │  .apply   → apply  │  │
+│  │  *.sh            │            │  .kubectl → exec   │  │
+│  └─────────────────┘            └───────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+| Trigger file | What the sidecar does | Signal when done |
+|---|---|---|
+| `<name>.request` | Reads `<name>.tar.gz` + `<name>.dest`, pipes into a one-shot Kaniko pod | `<name>.done` |
+| `<name>.apply` | Runs `kubectl apply -f <name>.yaml` | `<name>.apply-done` |
+| `<name>.kubectl` | Runs `bash <name>.sh` (arbitrary kubectl scripts) | `<name>.kubectl-done` |
+
+> **Important:** The `/builds` emptyDir persists across workflow runs (same pod). Always clean it at the start of each workflow to avoid stale signal files from a previous run.
 
 ### `DevStagingEnvironment`
 
@@ -152,7 +203,7 @@ metadata:
   name: jeff-dev
 spec:
   deployment:
-    image: myapp:abc123
+    image: registry:5000/myapp:jeff-abc123
     replicas: 1
     port: 8080
     healthCheck:
@@ -163,6 +214,7 @@ spec:
   ingress:
     enabled: true
     host: jeff-dev.localhost
+    ingressClassName: nginx
   dependencies:
     - type: postgres
       version: "16"
@@ -233,132 +285,106 @@ With the above, the operator creates:
 | [Go](https://go.dev/dl/) | 1.20+ |
 | [Kind](https://kind.sigs.k8s.io/) | 0.20+ |
 | [kubectl](https://kubernetes.io/docs/tasks/tools/) | 1.28+ |
-| [Docker](https://docs.docker.com/get-docker/) | 24+ |
+| [Docker](https://docs.docker.com/get-docker/) | 24+ (for building the operator image only — app images use Kaniko) |
 
 ### 1. Create a local Kind cluster
 
-Use the included config to enable Ingress support (maps ports 80/443 to localhost):
+Use the included config to enable Ingress support (maps ports 80/443 to localhost) and configure the containerd registry mirror for the in-cluster registry:
 
 ```bash
 kind create cluster --name dev --config kind-config.yaml
 ```
 
-Then install the ingress-nginx controller:
+Then install the ingress-nginx controller and the in-cluster image registry:
 
 ```bash
 chmod +x setup-ingress.sh && ./setup-ingress.sh
 ```
 
-> **Note:** If you skip this step and use a plain `kind create cluster`, everything still works — you’ll just use `kubectl port-forward` instead of `.localhost` hostnames.
+This deploys:
+- **registry:5000** — an in-cluster container registry (Kaniko pushes images here, containerd pulls from here)
+- **ingress-nginx** — routes `*.localhost` hostnames to Services inside the cluster
 
-### 2. Install the CRDs
+> **Note:** If you skip this step and use a plain `kind create cluster`, you'll need to use `kubectl port-forward` instead of `.localhost` hostnames, and image builds won't work without a registry.
+
+### 2. Build and deploy the operator
 
 ```bash
+# Build the operator image
+make docker-build IMG=controller:latest
+
+# Load it into Kind (no remote registry needed)
+kind load docker-image controller:latest --name dev
+
+# Install CRDs and deploy the operator
 make install
+make deploy IMG=controller:latest
 ```
 
-### 3. Create the GitHub token Secret
+### 3. Create the GitHub token Secret and runner pool
 
-Generate a [GitHub Personal Access Token](https://github.com/settings/tokens) with **`repo`** scope, then:
+Generate a [GitHub Personal Access Token](https://github.com/settings/tokens) with **`repo`** scope, then use the quickstart target:
 
 ```bash
-kubectl create secret generic github-runner-token \
-  --from-literal=github-token=ghp_YOUR_TOKEN_HERE
+make quickstart \
+  GITHUB_USERNAME=your-github-username \
+  GITHUB_REPO=your-org/your-repo \
+  GITHUB_PAT=ghp_YOUR_TOKEN_HERE
 ```
 
-> **How token exchange works:** You provide a long-lived Personal Access Token (PAT) in the Secret. When the runner pod starts, it **automatically exchanges** the PAT for a short-lived GitHub runner registration token via the GitHub API (`POST /repos/{owner}/{repo}/actions/runners/registration-token`). The registration token is used once to register the runner with GitHub, and on shutdown the pod obtains a removal token to cleanly de-register. Your PAT never leaves the cluster — only the ephemeral registration/removal tokens are sent to `config.sh`.
+This creates the Secret and `GithubActionRunnerPool` CR in one command. The operator will:
+1. Auto-provision a **ServiceAccount + ClusterRole + ClusterRoleBinding** for the runner
+2. Create a runner **Deployment** with two containers (runner + build-agent sidecar)
+3. Register the runner with GitHub using labels `[self-hosted, <username>]`
+
+> **How token exchange works:** You provide a long-lived Personal Access Token (PAT) in the Secret. When the runner pod starts, it **automatically exchanges** the PAT for a short-lived GitHub runner registration token via the GitHub API (`POST /repos/{owner}/{repo}/actions/runners/registration-token`). The registration token is used once to register the runner, and on shutdown a removal token cleanly de-registers it. Your PAT never leaves the cluster.
 >
-> **GitHub Enterprise Server** is supported out of the box: set `spec.githubURL` in your `GithubActionRunnerPool` CR and the operator will hit `{your-ghe-host}/api/v3` instead of `api.github.com`.
+> **GitHub Enterprise Server** is supported: set `spec.githubURL` in your `GithubActionRunnerPool` CR.
 
-### 4. Run the operator
-
-Run locally against your Kind cluster:
+### 4. Verify everything is running
 
 ```bash
-make run
-```
+# Operator
+kubectl get pods -n kindling-system
 
-**Or** build and deploy into the cluster:
+# Runner (should show 2/2 — runner + build-agent)
+kubectl get pods
 
-```bash
-make docker-build IMG=kindling:latest
-kind load docker-image kindling:latest --name dev
-make deploy IMG=kindling:latest
-```
-
-### 5. Create your runner pool
-
-Edit `config/samples/apps_v1alpha1_githubactionrunnerpool.yaml` with your GitHub username and repo, then:
-
-```bash
-kubectl apply -f config/samples/apps_v1alpha1_githubactionrunnerpool.yaml
-```
-
-Verify the runner is online:
-
-```bash
+# Runner pool status
 kubectl get githubactionrunnerpools
 ```
 
 ```
-NAME              USER          REPOSITORY     REPLICAS   READY   AGE
-jeff-runner-pool  jeffvincent   myorg/myrepo   1          1       30s
+NAME               USER           REPOSITORY                    REPLICAS   READY
+jeff-runner-pool   jeff-vincent   jeff-vincent/demo-kindling    1          1
 ```
 
-The runner will appear on your repository's **Settings → Actions → Runners** page on GitHub.
+The runner will also appear on your repository's **Settings → Actions → Runners** page on GitHub.
 
-### 6. Push code and watch it deploy
+### 5. Push code and watch it deploy
 
-Push a commit to your repo. The GitHub Actions workflow routes the job to your local runner, which builds the container and applies a `DevStagingEnvironment` CR. The operator takes it from there:
+Push a commit to your repo. The GitHub Actions workflow routes the job to your local runner, which builds the container via Kaniko, pushes it to `registry:5000`, and applies a `DevStagingEnvironment` CR. The operator takes it from there:
 
 ```bash
 kubectl get devstagingenvironments
+kubectl get pods
 ```
 
+Access your app via Ingress:
+
 ```
-NAME       IMAGE            REPLICAS   AVAILABLE   READY   AGE
-jeff-dev   myapp:abc123     1          1           true    15s
+http://<username>-<app>.localhost
 ```
 
-Access your app:
+Or fall back to port-forwarding:
 
 ```bash
-kubectl port-forward svc/jeff-dev 8080:8080
-# → http://localhost:8080
+kubectl port-forward svc/<username>-<app> 8080:8080
 ```
-
-> **💡 Tip:** Instead of port-forwarding, you can set up an Ingress for a cleaner experience. The `DevStagingEnvironment` CRD supports Ingress out of the box — see the [sample CR](config/samples/apps_v1alpha1_devstagingenvironment.yaml) for an example with `ingress.enabled: true` and a custom hostname like `jeff-dev.localhost`. Pair it with an Ingress controller (e.g. [ingress-nginx](https://kind.sigs.k8s.io/docs/user/ingress/#ingress-nginx)) in your Kind cluster for automatic routing.
-
-### Try the sample app (end-to-end)
-
-The repo includes a ready-to-go [sample app](examples/sample-app/) with a GitHub Actions workflow, a Dockerfile, and a `DevStagingEnvironment` CR. Copy it into a new repo to see the full loop in action:
-
-```bash
-# 1. Create a new project and copy the sample app into it
-mkdir my-app && cd my-app && git init
-cp -r /path/to/kindling/examples/sample-app/* .
-cp -r /path/to/kindling/examples/sample-app/.github .
-
-# 2. Point your GithubActionRunnerPool at the new repo
-#    (edit repository: "your-org/my-app" in the CR and re-apply)
-
-# 3. Push
-git remote add origin git@github.com:your-org/my-app.git
-git add -A && git commit -m "initial commit" && git push -u origin main
-```
-
-Your local runner picks up the workflow, builds the image, applies the CR, and the operator provisions the Deployment + Postgres + Redis. Then:
-
-```bash
-kubectl port-forward svc/<your-username>-dev 8080:8080
-curl http://localhost:8080/status | jq .
-```
-
-See the full walkthrough in the [sample app README](examples/sample-app/README.md).
 
 ### Try the microservices demo (multi-service + Redis queue)
 
-For a more realistic example, the repo includes a [microservices demo](examples/microservices/) with four services:
+For a realistic example, the repo includes a [microservices demo](examples/microservices/) with four services:
 
 | Service | Database | Role |
 |---|---|---|
@@ -367,27 +393,11 @@ For a more realistic example, the repo includes a [microservices demo](examples/
 | **orders** | Postgres 16 | Manages orders, publishes `order.created` events to a Redis queue |
 | **inventory** | MongoDB | Manages stock levels, consumes events from the Redis queue |
 
-```bash
-# Build and load all images
-for svc in gateway orders inventory ui; do
-  docker build -t ms-${svc}:dev examples/microservices/${svc}/
-  kind load docker-image ms-${svc}:dev --name dev
-done
-
-# Deploy all four services (operator provisions Postgres, MongoDB, Redis)
-kubectl apply -f examples/microservices/deploy/
-
-# With Ingress: open http://ui.localhost in your browser
-# Without Ingress: port-forward the gateway
-kubectl port-forward svc/microservices-gateway-dev 8080:8080
-curl localhost:8080/status | jq .                          # all services healthy
-curl -X POST localhost:8080/orders \
-  -H 'Content-Type: application/json' \
-  -d '{"product":"widget-a","quantity":3}' | jq .           # create an order
-sleep 2 && curl localhost:8080/inventory | jq .             # stock decremented!
-```
-
 See the full walkthrough in the [microservices README](examples/microservices/README.md).
+
+### Try the sample app (single-service)
+
+A simpler [sample app](examples/sample-app/) demonstrates the full loop with a single Go service, Postgres, and Redis. See the [sample app README](examples/sample-app/README.md).
 
 ---
 
@@ -418,15 +428,18 @@ See the full walkthrough in the [microservices README](examples/microservices/RE
 │       └── README.md                    #   Architecture & walkthrough
 ├── internal/controller/
 │   ├── devstagingenvironment_controller.go   # Reconciler → Deployment + Service + Ingress + Deps
-│   └── githubactionrunnerpool_controller.go  # Reconciler → Runner Deployment + Docker
+│   └── githubactionrunnerpool_controller.go  # Reconciler → Runner Deployment + RBAC + Sidecar
 ├── config/
 │   ├── crd/bases/                       # Generated CRD manifests
 │   ├── rbac/                            # ClusterRoles, bindings, service accounts
 │   ├── manager/                         # Operator Deployment manifest
+│   ├── registry/                        # In-cluster image registry (registry:2)
 │   ├── samples/                         # Example CRs to get started
 │   └── default/                         # Kustomize overlay for full deployment
 ├── Dockerfile                           # Multi-stage build for the operator image
-├── Makefile                             # Build, test, generate, deploy targets
+├── Makefile                             # Build, test, generate, deploy, quickstart targets
+├── kind-config.yaml                     # Kind cluster config (Ingress + registry mirror)
+├── setup-ingress.sh                     # Deploys registry + ingress-nginx
 └── PROJECT                              # Kubebuilder project metadata
 ```
 
@@ -440,25 +453,29 @@ flowchart LR
     gh -- "runs-on:\n[self-hosted, user]" --> runner
 
     subgraph cluster["☸  Kind Cluster — Developer's Laptop"]
-        runner("🏃 Runner Pod\n<i>/var/run/docker.sock</i>")
-        docker[("🐳 Host\nDocker")]
+        runner("🏃 Runner Pod\n<i>runner + build-agent</i>")
+        kaniko["🔨 Kaniko Pod\n<i>(one-shot)</i>"]
+        registry[("📦 registry:5000")]
         cr("📋 DevStagingEnvironment CR")
         operator("🔥 kindling\noperator")
         resources("📦 Deployment\n📡 Service\n🌐 Ingress")
 
-        runner <-- "builds via\nhost mount" --> docker
-        runner -- "checkout → build →\nkubectl apply" --> cr
+        runner -- "sidecar pipes\ntarball" --> kaniko
+        kaniko -- "pushes image" --> registry
+        runner -- "sidecar runs\nkubectl apply" --> cr
         cr -- "watches" --> operator
         operator -- "reconciles" --> resources
+        registry -- "image pull" --> resources
     end
 
-    resources -. "kubectl port-forward\nlocalhost:8080" .-> user("👩‍💻 Developer")
+    resources -. "http://app.localhost" .-> user("👩‍💻 Developer")
 
     style cluster fill:#0f3460,stroke:#326CE5,color:#e0e0e0,stroke-width:2px
     style push fill:#6e40c9,stroke:#6e40c9,color:#fff
     style gh fill:#24292f,stroke:#24292f,color:#fff
     style runner fill:#2ea043,stroke:#2ea043,color:#fff
-    style docker fill:#0db7ed,stroke:#0db7ed,color:#fff
+    style kaniko fill:#f0883e,stroke:#f0883e,color:#fff
+    style registry fill:#0db7ed,stroke:#0db7ed,color:#fff
     style cr fill:#f0883e,stroke:#f0883e,color:#fff
     style operator fill:#FF6B35,stroke:#FF6B35,color:#fff
     style resources fill:#326CE5,stroke:#326CE5,color:#fff
@@ -467,15 +484,15 @@ flowchart LR
 
 1. **Developer creates a Kind cluster** on their laptop and deploys the operator + a `GithubActionRunnerPool` CR with their GitHub username.
 
-2. **The operator spins up a runner Deployment** with the GitHub Actions runner image and mounts the host Docker socket (or a DinD sidecar, if configured). On startup the runner **exchanges the PAT for a short-lived registration token** and self-registers with GitHub using labels `[self-hosted, <username>]`.
+2. **The operator spins up a runner Deployment** with two containers: the GitHub Actions runner and a build-agent sidecar. It also auto-provisions RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding). On startup the runner **exchanges the PAT for a short-lived registration token** and self-registers with GitHub using labels `[self-hosted, <username>]`.
 
 3. **Developer pushes code.** The GitHub Actions workflow fires with `runs-on: [self-hosted, <username>]`, routing the job to *that developer's laptop*.
 
-4. **The runner executes the job**: checks out the code, builds a Docker image via the mounted Docker socket, and runs `kubectl apply` to create a `DevStagingEnvironment` CR.
+4. **The runner executes the job**: checks out the code, writes build artifacts to the shared `/builds` volume. The build-agent sidecar detects trigger files and launches **Kaniko pods** to build container images, pushing them to the **in-cluster registry** at `registry:5000`.
 
-5. **The operator reconciles the `DevStagingEnvironment`**: creates a Deployment running the freshly built image, a Service, and optionally an Ingress — all on the local Kind cluster.
+5. **The runner applies a `DevStagingEnvironment` CR** (via the sidecar's `kubectl apply`). The operator reconciles it: creates a Deployment pulling the image from the in-cluster registry, a Service, optional Ingress, and auto-provisions any declared dependencies (Postgres, Redis, MongoDB, etc.).
 
-6. **The developer hits localhost** via `kubectl port-forward` or an Ingress controller, seeing their changes running in a real Kubernetes environment instantly.
+6. **The developer hits localhost** via Ingress (`http://app.localhost`) or `kubectl port-forward`, seeing their changes running in a real Kubernetes environment instantly.
 
 ---
 
@@ -495,7 +512,7 @@ make fmt vet
 make build
 
 # Build the Docker image
-make docker-build IMG=kindling:dev
+make docker-build IMG=controller:dev
 ```
 
 ### Modifying the API
@@ -532,6 +549,10 @@ kind delete cluster --name dev
 - [x] Multi-service environments — deploy databases, caches, and queues alongside the app
 - [x] Automatic PAT → registration token exchange — no manual token juggling
 - [x] GitHub Enterprise Server support via `spec.githubURL`
+- [x] In-cluster image builds via Kaniko (no Docker daemon required)
+- [x] Build-agent sidecar architecture — runner image stays stock/unprivileged
+- [x] Auto-provisioned RBAC per runner pool
+- [x] In-cluster container registry for Kaniko → containerd image flow
 - [ ] CLI bootstrap tool — one command to create cluster + install operator + register runner
 - [ ] Webhook receiver for GitHub push events as an alternative to long-polling
 

@@ -108,6 +108,40 @@ ifndef ignore-not-found
   ignore-not-found = false
 endif
 
+# ── Quickstart ────────────────────────────────────────────────────
+# One-command setup: creates the GitHub PAT secret and applies the
+# runner pool CR. Requires GITHUB_USERNAME, GITHUB_REPO, and GITHUB_PAT.
+#
+#   make quickstart \
+#     GITHUB_USERNAME=jeff-vincent \
+#     GITHUB_REPO=jeff-vincent/demo-kindling \
+#     GITHUB_PAT=ghp_xxxxxxxxxxxx
+#
+GITHUB_USERNAME ?=
+GITHUB_REPO ?=
+GITHUB_PAT ?=
+
+.PHONY: quickstart
+quickstart: ## Create GitHub PAT secret + runner pool CR (requires GITHUB_USERNAME, GITHUB_REPO, GITHUB_PAT).
+	@if [ -z "$(GITHUB_USERNAME)" ] || [ -z "$(GITHUB_REPO)" ] || [ -z "$(GITHUB_PAT)" ]; then \
+		echo "❌ Usage: make quickstart GITHUB_USERNAME=<user> GITHUB_REPO=<org/repo> GITHUB_PAT=<token>"; \
+		exit 1; \
+	fi
+	@echo "🔑 Creating github-runner-token secret..."
+	@$(KUBECTL) create secret generic github-runner-token \
+		--from-literal=github-token=$(GITHUB_PAT) \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	@echo "✅ Secret github-runner-token ready"
+	@echo ""
+	@echo "🚀 Applying GithubActionRunnerPool CR..."
+	@printf 'apiVersion: apps.example.com/v1alpha1\nkind: GithubActionRunnerPool\nmetadata:\n  name: $(GITHUB_USERNAME)-runner-pool\nspec:\n  githubUsername: "$(GITHUB_USERNAME)"\n  repository: "$(GITHUB_REPO)"\n  tokenSecretRef:\n    name: github-runner-token\n    key: github-token\n  replicas: 1\n  labels:\n    - linux\n' | $(KUBECTL) apply -f -
+	@echo "✅ GithubActionRunnerPool applied"
+	@echo ""
+	@echo "⏳ Waiting for runner deployment..."
+	@$(KUBECTL) rollout status deployment/$(GITHUB_USERNAME)-runner --timeout=120s || true
+	@echo ""
+	@echo "🎉 Runner is ready! Trigger a workflow at https://github.com/$(GITHUB_REPO)/actions"
+
 .PHONY: install
 install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) apply -f -

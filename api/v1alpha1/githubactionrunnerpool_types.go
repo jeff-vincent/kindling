@@ -22,25 +22,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// DockerMode determines how runner pods access Docker for container builds.
-// +kubebuilder:validation:Enum=socket;dind;none
-type DockerMode string
-
-const (
-	// DockerModeSocket mounts the host Docker socket — lightest weight, best for Kind.
-	DockerModeSocket DockerMode = "socket"
-	// DockerModeDinD runs a Docker-in-Docker sidecar — fully isolated, heavier.
-	DockerModeDinD DockerMode = "dind"
-	// DockerModeNone disables Docker entirely — for non-build runners.
-	DockerModeNone DockerMode = "none"
-)
-
 // GithubActionRunnerPoolSpec defines the desired state of GithubActionRunnerPool.
 //
 // Each GithubActionRunnerPool maps 1:1 to a developer. The operator and this CR
 // live inside the developer's local Kind cluster. The runner pod polls GitHub for
-// jobs triggered by the developer's pushes, builds the app container in-cluster,
-// and spins up an ephemeral DevStagingEnvironment on the same cluster.
+// jobs triggered by the developer's pushes. Container images are built in-cluster
+// using Kaniko (no Docker daemon required) and pushed to an in-cluster registry.
 type GithubActionRunnerPoolSpec struct {
 	// GitHubUsername is the GitHub handle of the developer who owns this runner pool.
 	// The username is added as a runner label so the CI workflow can route jobs to the
@@ -99,24 +86,9 @@ type GithubActionRunnerPoolSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	// WorkDir is the working directory mount path inside the runner container.
-	//+kubebuilder:default="/runner/_work"
+	//+kubebuilder:default="/home/runner/_work"
 	//+optional
 	WorkDir string `json:"workDir,omitempty"`
-
-	// DockerMode controls how the runner accesses Docker for building container images.
-	//
-	//   - "socket"  (default) — Mounts the host's /var/run/docker.sock into the runner pod.
-	//                 Lightest weight, best layer caching, images land on the host Docker
-	//                 (where `kind load` pulls from). No privileged sidecar needed.
-	//   - "dind"    — Runs a Docker-in-Docker sidecar (docker:dind) as a privileged container.
-	//                 Fully isolated but heavier and no layer cache between restarts.
-	//   - "none"    — No Docker access. Use this if the runner only runs non-build jobs
-	//                 or uses an external image build service.
-	//
-	//+kubebuilder:validation:Enum=socket;dind;none
-	//+kubebuilder:default="socket"
-	//+optional
-	DockerMode DockerMode `json:"dockerMode,omitempty"`
 
 	// VolumeMounts are additional volume mounts for the runner container.
 	//+optional
@@ -198,8 +170,8 @@ type GithubActionRunnerPoolStatus struct {
 // GithubActionRunnerPool is the Schema for the githubactionrunnerpools API.
 // It runs on a developer's local Kind cluster. The runner pod registers with GitHub
 // as a self-hosted runner labelled with the developer's username, polls for CI jobs
-// triggered by that developer's pushes, builds the app container image (via host
-// Docker socket or optional DinD), and creates a DevStagingEnvironment CR to deploy it locally.
+// triggered by that developer's pushes, and uses Kaniko + an in-cluster registry to
+// build container images without requiring a Docker daemon.
 type GithubActionRunnerPool struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
