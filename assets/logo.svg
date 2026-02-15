@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="flame-outer" x1="0%" y1="100%" x2="50%" y2="0%">
+      <stop offset="0%" stop-color="#FF6B35"/>
+      <stop offset="50%" stop-color="#F7931E"/>
+      <stop offset="100%" stop-color="#FFD23F"/>
+    </linearGradient>
+    <linearGradient id="flame-inner" x1="0%" y1="100%" x2="50%" y2="0%">
+      <stop offset="0%" stop-color="#FFD23F"/>
+      <stop offset="100%" stop-color="#FFF5CC"/>
+    </linearGradient>
+    <linearGradient id="logs" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#8B5E3C"/>
+      <stop offset="100%" stop-color="#5C3A1E"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Logs / base -->
+  <rect x="14" y="50" width="36" height="5" rx="2.5" fill="url(#logs)" transform="rotate(-8 32 52)"/>
+  <rect x="14" y="50" width="36" height="5" rx="2.5" fill="url(#logs)" transform="rotate(8 32 52)"/>
+  <!-- Outer flame -->
+  <path d="M32 4 C32 4, 14 24, 14 36 C14 46, 22 54, 32 54 C42 54, 50 46, 50 36 C50 24, 32 4, 32 4 Z"
+        fill="url(#flame-outer)" filter="url(#glow)" opacity="0.95"/>
+  <!-- Mid flame -->
+  <path d="M32 14 C32 14, 20 28, 20 37 C20 44, 25 49, 32 49 C39 49, 44 44, 44 37 C44 28, 32 14, 32 14 Z"
+        fill="#FFAD33" opacity="0.85"/>
+  <!-- Inner flame -->
+  <path d="M32 24 C32 24, 25 33, 25 38 C25 42, 28 46, 32 46 C36 46, 39 42, 39 38 C39 33, 32 24, 32 24 Z"
+        fill="url(#flame-inner)" opacity="0.95"/>
+  <!-- Spark particles -->
+  <circle cx="22" cy="18" r="1.2" fill="#FFD23F" opacity="0.7"/>
+  <circle cx="40" cy="14" r="1" fill="#FFD23F" opacity="0.6"/>
+  <circle cx="26" cy="10" r="0.8" fill="#FFA500" opacity="0.5"/>
+</svg>

@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT" />
 </p>
 
-# kindling
+# <img src="assets/logo.svg" width="36" height="36" alt="kindling" style="vertical-align: middle;" /> kindling
 
 **Push code. Your laptop builds it. Your laptop runs it. Zero cloud CI minutes.**
 
@@ -25,33 +25,34 @@ Most teams pay for cloud CI runners that:
 
 `kindling` flips the model. Each developer runs a lightweight Kind cluster. Inside it, a self-hosted GitHub Actions runner polls for CI jobs triggered by *their* pushes. When a job arrives, the runner builds the container using the host Docker socket (the same daemon Kind itself uses), then the operator deploys the result as a full staging environment — Deployment, Service, and optional Ingress — right on localhost.
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Developer's Machine                                │
-│                                                     │
-│  ┌───────────────── Kind Cluster ─────────────────┐ │
-│  │                                                 │ │
-│  │  ┌─────────────────┐   ┌─────────────────────┐ │ │
-│  │  │ kindling    │   │ GithubActionRunner  │ │ │
-│  │  │ controller       │   │ Pool (runner pod    │ │ │
-│  │  │                  │   │ + Docker socket)    │ │ │
-│  │  └────────┬─────────┘   └──────────┬──────────┘ │ │
-│  │           │  creates               │ polls GH   │ │
-│  │           ▼                        │ builds app  │ │
-│  │  ┌─────────────────┐              │             │ │
-│  │  │ DevStagingEnv   │◄─────────────┘             │ │
-│  │  │ (Deployment +   │  applies CR after build    │ │
-│  │  │  Service + Ing) │                            │ │
-│  │  └─────────────────┘                            │ │
-│  └─────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────┘
-         ▲                          │
-         │  git push                │ runs-on: [self-hosted, <username>]
-         │                          ▼
-    ┌────────────┐          ┌───────────────┐
-    │  Developer │          │  GitHub.com   │
-    │  (git)     │          │  Actions      │
-    └────────────┘          └───────────────┘
+```mermaid
+flowchart TB
+    dev("👩‍💻 Developer\n<i>git push</i>")
+    gh("🐙 GitHub.com\nActions")
+
+    dev -- "git push" --> gh
+    gh -- "runs-on: [self-hosted, ‹username›]" --> runner
+
+    subgraph machine["🖥️  Developer's Machine"]
+        subgraph kind["☸  Kind Cluster"]
+            controller("🔥 kindling\ncontroller")
+            runner("🏃 GithubActionRunnerPool\n<i>runner pod + Docker socket</i>")
+            staging("📦 DevStagingEnv\n<i>Deployment + Service + Ingress</i>")
+
+            controller -- "creates &\nreconciles" --> staging
+            runner -- "polls GH, builds app,\napplies CR" --> staging
+        end
+    end
+
+    staging -. "localhost:8080" .-> dev
+
+    style machine fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style kind fill:#0f3460,stroke:#326CE5,color:#e0e0e0,stroke-width:2px
+    style controller fill:#FF6B35,stroke:#FF6B35,color:#fff
+    style runner fill:#2ea043,stroke:#2ea043,color:#fff
+    style staging fill:#326CE5,stroke:#326CE5,color:#fff
+    style dev fill:#6e40c9,stroke:#6e40c9,color:#fff
+    style gh fill:#24292f,stroke:#24292f,color:#fff
 ```
 
 ---
@@ -377,33 +378,35 @@ See the full walkthrough in the [sample app README](examples/sample-app/README.m
 
 ## How It All Fits Together
 
-```
-  git push ──► GitHub Actions ──► runs-on: [self-hosted, jeffvincent]
-                                          │
-                                          ▼
-                            ┌──── Kind Cluster (laptop) ─────┐
-                            │                                 │
-                            │  Runner Pod    /var/run/docker.sock  │
-                            │  ┌────────────┐  (host mount)  │
-                            │  │ checkout   │                │
-                            │  │ build      │◄── host Docker │
-                            │  │ kubectl    │    daemon      │
-                            │  │ apply CR   │                │
-                            │  └─────┬──────┘                 │
-                            │        │ creates                │
-                            │        ▼                        │
-                            │  DevStagingEnvironment CR       │
-                            │        │                        │
-                            │        │ operator reconciles    │
-                            │        ▼                        │
-                            │  ┌──────────────────────┐       │
-                            │  │ Deployment (app)     │       │
-                            │  │ Service              │       │
-                            │  │ Ingress (optional)   │       │
-                            │  └──────────────────────┘       │
-                            │                                 │
-                            │  localhost:8080 ◄── port-forward│
-                            └─────────────────────────────────┘
+```mermaid
+flowchart LR
+    push("🚀 git push") --> gh("⚡ GitHub\nActions")
+    gh -- "runs-on:\n[self-hosted, user]" --> runner
+
+    subgraph cluster["☸  Kind Cluster — Developer's Laptop"]
+        runner("🏃 Runner Pod\n<i>/var/run/docker.sock</i>")
+        docker[("🐳 Host\nDocker")]
+        cr("📋 DevStagingEnvironment CR")
+        operator("🔥 kindling\noperator")
+        resources("📦 Deployment\n📡 Service\n🌐 Ingress")
+
+        runner <-- "builds via\nhost mount" --> docker
+        runner -- "checkout → build →\nkubectl apply" --> cr
+        cr -- "watches" --> operator
+        operator -- "reconciles" --> resources
+    end
+
+    resources -. "kubectl port-forward\nlocalhost:8080" .-> user("👩‍💻 Developer")
+
+    style cluster fill:#0f3460,stroke:#326CE5,color:#e0e0e0,stroke-width:2px
+    style push fill:#6e40c9,stroke:#6e40c9,color:#fff
+    style gh fill:#24292f,stroke:#24292f,color:#fff
+    style runner fill:#2ea043,stroke:#2ea043,color:#fff
+    style docker fill:#0db7ed,stroke:#0db7ed,color:#fff
+    style cr fill:#f0883e,stroke:#f0883e,color:#fff
+    style operator fill:#FF6B35,stroke:#FF6B35,color:#fff
+    style resources fill:#326CE5,stroke:#326CE5,color:#fff
+    style user fill:#6e40c9,stroke:#6e40c9,color:#fff
 ```
 
 1. **Developer creates a Kind cluster** on their laptop and deploys the operator + a `GithubActionRunnerPool` CR with their GitHub username.
