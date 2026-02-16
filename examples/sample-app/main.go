@@ -4,7 +4,8 @@
 // REDIS_URL), and exposes a few HTTP endpoints.
 //
 // This is intentionally minimal — just enough to prove the full flow:
-//   git push → GH Actions → self-hosted runner → build container → deploy to Kind
+//
+//	git push → GH Actions → self-hosted runner → build container → deploy to Kind
 package main
 
 import (

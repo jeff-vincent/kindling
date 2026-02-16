@@ -1,0 +1,8 @@
+# Compiled binaries
+bin/
+cover.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
