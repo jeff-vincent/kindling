@@ -1,0 +1,192 @@
+# ─────────────────────────────────────────────────────────────────
+# kindling-deploy — Reusable composite action for deploying a
+# DevStagingEnvironment CR via the build-agent sidecar.
+#
+# Generates the DSE YAML from inputs, triggers the sidecar's
+# kubectl apply, and optionally waits for the deployment rollout.
+# ─────────────────────────────────────────────────────────────────
+name: "kindling-deploy"
+description: "Deploy a DevStagingEnvironment CR via the build-agent sidecar"
+
+inputs:
+  name:
+    description: "DSE metadata.name (typically <actor>-<service>)"
+    required: true
+  image:
+    description: "Container image reference"
+    required: true
+  port:
+    description: "Container port"
+    required: true
+  labels:
+    description: "Extra labels as YAML block (indented under metadata.labels)"
+    required: false
+    default: ""
+  env:
+    description: "Extra env vars as YAML block (indented under spec.deployment.env)"
+    required: false
+    default: ""
+  dependencies:
+    description: "Dependencies as YAML block (indented under spec.dependencies)"
+    required: false
+    default: ""
+  ingress-host:
+    description: "Ingress hostname (leave empty to skip ingress)"
+    required: false
+    default: ""
+  ingress-class:
+    description: "Ingress class name"
+    required: false
+    default: "nginx"
+  health-check-path:
+    description: "HTTP health check path"
+    required: false
+    default: "/healthz"
+  replicas:
+    description: "Number of replicas"
+    required: false
+    default: "1"
+  service-type:
+    description: "Service type (ClusterIP, NodePort, LoadBalancer)"
+    required: false
+    default: "ClusterIP"
+  wait:
+    description: "Wait for deployment rollout (true/false)"
+    required: false
+    default: "true"
+  wait-timeout:
+    description: "Rollout wait timeout"
+    required: false
+    default: "180s"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Deploy ${{ inputs.name }}"
+      shell: bash
+      env:
+        DSE_NAME: ${{ inputs.name }}
+        DSE_IMAGE: ${{ inputs.image }}
+        DSE_PORT: ${{ inputs.port }}
+        DSE_LABELS: ${{ inputs.labels }}
+        DSE_ENV: ${{ inputs.env }}
+        DSE_DEPS: ${{ inputs.dependencies }}
+        DSE_INGRESS_HOST: ${{ inputs.ingress-host }}
+        DSE_INGRESS_CLASS: ${{ inputs.ingress-class }}
+        DSE_HEALTH_PATH: ${{ inputs.health-check-path }}
+        DSE_REPLICAS: ${{ inputs.replicas }}
+        DSE_SVC_TYPE: ${{ inputs.service-type }}
+        DSE_WAIT: ${{ inputs.wait }}
+        DSE_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+      run: |
+        echo "🚀 Deploying ${DSE_NAME}"
+
+        # ── Generate DSE YAML ────────────────────────────────────
+        YAML_FILE="/builds/${DSE_NAME}-dse.yaml"
+
+        cat > "${YAML_FILE}" <<DSEEOF
+        apiVersion: apps.example.com/v1alpha1
+        kind: DevStagingEnvironment
+        metadata:
+          name: ${DSE_NAME}
+          labels:
+            app.kubernetes.io/name: ${DSE_NAME}
+            app.kubernetes.io/managed-by: kindling
+        DSEEOF
+
+        # Append extra labels if provided
+        if [ -n "${DSE_LABELS}" ]; then
+          echo "${DSE_LABELS}" | sed 's/^/    /' >> "${YAML_FILE}"
+        fi
+
+        cat >> "${YAML_FILE}" <<SPECEOF
+        spec:
+          deployment:
+            image: ${DSE_IMAGE}
+            replicas: ${DSE_REPLICAS}
+            port: ${DSE_PORT}
+            healthCheck:
+              path: ${DSE_HEALTH_PATH}
+        SPECEOF
+
+        # Append env if provided
+        if [ -n "${DSE_ENV}" ]; then
+          echo "        env:" >> "${YAML_FILE}"
+          echo "${DSE_ENV}" | sed 's/^/          /' >> "${YAML_FILE}"
+        fi
+
+        cat >> "${YAML_FILE}" <<SVCEOF
+          service:
+            port: ${DSE_PORT}
+            type: ${DSE_SVC_TYPE}
+        SVCEOF
+
+        # Append ingress if host is set
+        if [ -n "${DSE_INGRESS_HOST}" ]; then
+          cat >> "${YAML_FILE}" <<INGEOF
+          ingress:
+            enabled: true
+            host: ${DSE_INGRESS_HOST}
+            ingressClassName: ${DSE_INGRESS_CLASS}
+        INGEOF
+        fi
+
+        # Append dependencies if provided
+        if [ -n "${DSE_DEPS}" ]; then
+          echo "        dependencies:" >> "${YAML_FILE}"
+          echo "${DSE_DEPS}" | sed 's/^/          /' >> "${YAML_FILE}"
+        fi
+
+        echo "📄 Generated DSE:"
+        cat "${YAML_FILE}"
+        echo ""
+
+        # ── Apply via sidecar ────────────────────────────────────
+        touch "${YAML_FILE%.yaml}.apply"
+        WAITED=0
+        while [ ! -f "${YAML_FILE%.yaml}.apply-done" ]; do
+          sleep 1
+          WAITED=$((WAITED+1))
+          if [ ${WAITED} -ge 60 ]; then
+            echo "❌ Timed out waiting for sidecar to apply ${DSE_NAME}"
+            exit 1
+          fi
+        done
+
+        EXIT_CODE=$(cat "${YAML_FILE%.yaml}.apply-exitcode" 2>/dev/null || echo "1")
+        if [ "${EXIT_CODE}" != "0" ]; then
+          echo "❌ Deploy ${DSE_NAME} failed:"
+          cat "${YAML_FILE%.yaml}.apply-log" 2>/dev/null || true
+          exit 1
+        fi
+        echo "✅ ${DSE_NAME} applied"
+
+    - name: "Wait for ${{ inputs.name }} rollout"
+      if: ${{ inputs.wait == 'true' }}
+      shell: bash
+      env:
+        DSE_NAME: ${{ inputs.name }}
+        DSE_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+      run: |
+        # Use sidecar for kubectl access
+        cat > /builds/${DSE_NAME}-rollout.sh <<SCRIPT
+        #!/bin/bash
+        # Wait for the deployment to exist
+        for i in \$(seq 1 30); do
+          if kubectl get deployment/${DSE_NAME} >/dev/null 2>&1; then
+            break
+          fi
+          sleep 2
+        done
+        kubectl rollout status deployment/${DSE_NAME} --timeout=${DSE_WAIT_TIMEOUT}
+        SCRIPT
+        chmod +x /builds/${DSE_NAME}-rollout.sh
+        touch /builds/${DSE_NAME}-rollout.kubectl
+        while [ ! -f /builds/${DSE_NAME}-rollout.kubectl-done ]; do sleep 2; done
+        cat /builds/${DSE_NAME}-rollout.kubectl-log
+        EXIT_CODE=$(cat /builds/${DSE_NAME}-rollout.kubectl-exitcode 2>/dev/null || echo "1")
+        if [ "${EXIT_CODE}" != "0" ]; then
+          echo "⚠️  Rollout for ${DSE_NAME} did not complete within timeout"
+        else
+          echo "✅ ${DSE_NAME} is running"
+        fi

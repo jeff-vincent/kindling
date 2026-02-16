@@ -1,0 +1,211 @@
+# ─────────────────────────────────────────────────────────────────
+# kindling-detect-changes — Reusable composite action that checks:
+#   1. Which services have file changes in the current push
+#   2. Which services already have running deployments
+#
+# Outputs a per-service "should build" flag so workflows can skip
+# unchanged services on subsequent pushes. On the first run (no
+# existing deployments), everything gets built.
+# ─────────────────────────────────────────────────────────────────
+name: "kindling-detect-changes"
+description: "Detect which services have changes and which are already deployed"
+
+inputs:
+  services:
+    description: |
+      JSON array of service definitions. Each entry must have:
+        - name: service identifier (used in output keys)
+        - path: directory path to watch for changes
+      Example: '[{"name":"api","path":"./"},{"name":"ui","path":"./ui"}]'
+    required: true
+  actor:
+    description: "GitHub actor (username) — used to find existing deployments"
+    required: true
+
+outputs:
+  changes:
+    description: |
+      JSON object mapping service name → boolean. true = needs build.
+      Example: {"api":true,"ui":false}
+    value: ${{ steps.detect.outputs.changes }}
+  summary:
+    description: "Human-readable summary of what changed"
+    value: ${{ steps.detect.outputs.summary }}
+  any-changes:
+    description: "true if at least one service needs building"
+    value: ${{ steps.detect.outputs.any_changes }}
+  all-running:
+    description: "true if all services already have running deployments"
+    value: ${{ steps.detect.outputs.all_running }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Clean builds directory
+      shell: bash
+      run: |
+        echo "🧹 Cleaning stale signal files from /builds..."
+        rm -f /builds/*.done /builds/*.request /builds/*.processing \
+              /builds/*.apply /builds/*.apply-done /builds/*.apply-log \
+              /builds/*.apply-exitcode /builds/*.kubectl \
+              /builds/*.kubectl-done /builds/*.kubectl-log \
+              /builds/*.kubectl-exitcode /builds/*.exitcode \
+              /builds/*.log /builds/*.dest /builds/*.tar.gz \
+              /builds/*.yaml /builds/*.sh /builds/portfwd-ready \
+              /builds/portfwd-stop
+        echo "✅ /builds is clean"
+
+    - name: Detect changes and running services
+      id: detect
+      shell: bash
+      env:
+        SERVICES_JSON: ${{ inputs.services }}
+        ACTOR: ${{ inputs.actor }}
+      run: |
+        echo "🔍 Detecting changes..."
+
+        # ── Get changed files from git ───────────────────────────
+        # Compare against the previous commit. On first push, diff
+        # against an empty tree so everything shows as changed.
+        PREV_SHA="${{ github.event.before }}"
+        if [ -z "${PREV_SHA}" ] || [ "${PREV_SHA}" = "0000000000000000000000000000000000000000" ]; then
+          echo "  First push — marking all services as changed"
+          CHANGED_FILES="__ALL__"
+        else
+          CHANGED_FILES=$(git diff --name-only "${PREV_SHA}" HEAD 2>/dev/null || echo "__ALL__")
+          if [ -z "${CHANGED_FILES}" ]; then
+            CHANGED_FILES="__ALL__"
+          fi
+        fi
+
+        echo "  Changed files:"
+        if [ "${CHANGED_FILES}" = "__ALL__" ]; then
+          echo "    (all — first push or unable to diff)"
+        else
+          echo "${CHANGED_FILES}" | head -20 | sed 's/^/    /'
+          TOTAL=$(echo "${CHANGED_FILES}" | wc -l | tr -d ' ')
+          if [ "${TOTAL}" -gt 20 ]; then
+            echo "    ... and $((TOTAL-20)) more"
+          fi
+        fi
+
+        # ── Check running deployments via sidecar ────────────────
+        cat > /builds/detect-running.sh <<SCRIPT
+        #!/bin/bash
+        kubectl get deployments -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+        SCRIPT
+        chmod +x /builds/detect-running.sh
+        touch /builds/detect-running.kubectl
+        while [ ! -f /builds/detect-running.kubectl-done ]; do sleep 1; done
+        RUNNING_DEPLOYS=$(cat /builds/detect-running.kubectl-log 2>/dev/null || echo "")
+
+        echo ""
+        echo "  Running deployments:"
+        if [ -n "${RUNNING_DEPLOYS}" ]; then
+          echo "${RUNNING_DEPLOYS}" | grep "${ACTOR}" | sed 's/^/    /' || echo "    (none for ${ACTOR})"
+        else
+          echo "    (none)"
+        fi
+
+        # ── Build per-service change map ─────────────────────────
+        CHANGES="{"
+        SUMMARY=""
+        ANY_CHANGES="false"
+        ALL_RUNNING="true"
+        FIRST="true"
+
+        # Parse JSON array with basic bash (no jq dependency in runner)
+        # Expected format: [{"name":"x","path":"y"},...]
+        SERVICES=$(echo "${SERVICES_JSON}" | tr -d '[]' | sed 's/},{/}\n{/g')
+
+        while IFS= read -r svc; do
+          [ -z "${svc}" ] && continue
+
+          # Extract name and path (simple JSON parsing)
+          SVC_NAME=$(echo "${svc}" | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+          SVC_PATH=$(echo "${svc}" | sed 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+          # Normalize path: remove leading ./
+          SVC_PATH_CLEAN=$(echo "${SVC_PATH}" | sed 's|^\./||')
+
+          # Check if deployment exists for this service
+          DEPLOY_NAME="${ACTOR}-${SVC_NAME}"
+          IS_RUNNING="false"
+          if echo "${RUNNING_DEPLOYS}" | grep -q "^${DEPLOY_NAME}$"; then
+            IS_RUNNING="true"
+          fi
+
+          if [ "${IS_RUNNING}" = "false" ]; then
+            ALL_RUNNING="false"
+          fi
+
+          # Check if any changed files are under this service's path
+          HAS_CHANGES="false"
+          if [ "${CHANGED_FILES}" = "__ALL__" ]; then
+            HAS_CHANGES="true"
+          elif [ "${SVC_PATH_CLEAN}" = "" ] || [ "${SVC_PATH_CLEAN}" = "." ]; then
+            # Root path — any change triggers build
+            HAS_CHANGES="true"
+          else
+            if echo "${CHANGED_FILES}" | grep -q "^${SVC_PATH_CLEAN}/"; then
+              HAS_CHANGES="true"
+            fi
+            # Also check workflow file changes
+            if echo "${CHANGED_FILES}" | grep -q "\.github/workflows/"; then
+              HAS_CHANGES="true"
+            fi
+          fi
+
+          # Decision: build if changed OR not running yet
+          SHOULD_BUILD="false"
+          REASON=""
+          if [ "${IS_RUNNING}" = "false" ]; then
+            SHOULD_BUILD="true"
+            REASON="not deployed yet"
+          elif [ "${HAS_CHANGES}" = "true" ]; then
+            SHOULD_BUILD="true"
+            REASON="has changes"
+          else
+            REASON="no changes, already running"
+          fi
+
+          if [ "${SHOULD_BUILD}" = "true" ]; then
+            ANY_CHANGES="true"
+          fi
+
+          # Append to JSON
+          if [ "${FIRST}" = "true" ]; then
+            FIRST="false"
+          else
+            CHANGES="${CHANGES},"
+          fi
+          CHANGES="${CHANGES}\"${SVC_NAME}\":${SHOULD_BUILD}"
+
+          # Append to summary
+          if [ "${SHOULD_BUILD}" = "true" ]; then
+            SUMMARY="${SUMMARY}\n  🔨 ${SVC_NAME}: BUILD (${REASON})"
+          else
+            SUMMARY="${SUMMARY}\n  ⏭️  ${SVC_NAME}: SKIP (${REASON})"
+          fi
+
+          echo "  ${SVC_NAME}: should_build=${SHOULD_BUILD} (${REASON})"
+
+        done <<< "${SERVICES}"
+
+        CHANGES="${CHANGES}}"
+
+        echo ""
+        echo "📋 Change detection result:"
+        echo -e "${SUMMARY}"
+        echo ""
+        echo "  changes=${CHANGES}"
+        echo "  any_changes=${ANY_CHANGES}"
+        echo "  all_running=${ALL_RUNNING}"
+
+        # ── Set outputs ──────────────────────────────────────────
+        echo "changes=${CHANGES}" >> $GITHUB_OUTPUT
+        echo "summary<<EOFSUM" >> $GITHUB_OUTPUT
+        echo -e "${SUMMARY}" >> $GITHUB_OUTPUT
+        echo "EOFSUM" >> $GITHUB_OUTPUT
+        echo "any_changes=${ANY_CHANGES}" >> $GITHUB_OUTPUT
+        echo "all_running=${ALL_RUNNING}" >> $GITHUB_OUTPUT

@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────
+# kindling-build — Reusable composite action for building container
+# images via the Kaniko build-agent sidecar on kindling runner pods.
+#
+# Replaces 10+ lines of signal-file boilerplate per service with a
+# single step. Works with the /builds emptyDir shared between the
+# runner and build-agent containers.
+# ─────────────────────────────────────────────────────────────────
+name: "kindling-build"
+description: "Build and push a container image via the Kaniko build-agent sidecar"
+
+inputs:
+  name:
+    description: "Unique build name (used for signal files: /builds/<name>.*)"
+    required: true
+  context:
+    description: "Path to the build context directory"
+    required: true
+  image:
+    description: "Full image reference (registry/name:tag)"
+    required: true
+  exclude:
+    description: "tar --exclude patterns (space-separated, e.g. './ui ./.git')"
+    required: false
+    default: ""
+  timeout:
+    description: "Max seconds to wait for the build to complete"
+    required: false
+    default: "300"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Build ${{ inputs.name }}"
+      shell: bash
+      env:
+        BUILD_NAME: ${{ inputs.name }}
+        BUILD_CONTEXT: ${{ inputs.context }}
+        BUILD_IMAGE: ${{ inputs.image }}
+        BUILD_EXCLUDE: ${{ inputs.exclude }}
+        BUILD_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        echo "🏗️  Building ${BUILD_NAME} → ${BUILD_IMAGE}"
+
+        # ── Create tarball ───────────────────────────────────────
+        EXCLUDE_FLAGS=""
+        if [ -n "${BUILD_EXCLUDE}" ]; then
+          for pattern in ${BUILD_EXCLUDE}; do
+            EXCLUDE_FLAGS="${EXCLUDE_FLAGS} --exclude=${pattern}"
+          done
+        fi
+
+        eval tar -czf /builds/${BUILD_NAME}.tar.gz \
+          -C "${BUILD_CONTEXT}" ${EXCLUDE_FLAGS} .
+
+        # ── Trigger sidecar build ────────────────────────────────
+        echo "${BUILD_IMAGE}" > /builds/${BUILD_NAME}.dest
+        touch /builds/${BUILD_NAME}.request
+
+        # ── Wait for completion ──────────────────────────────────
+        WAITED=0
+        while [ ! -f /builds/${BUILD_NAME}.done ]; do
+          sleep 2
+          WAITED=$((WAITED+2))
+          if [ ${WAITED} -ge ${BUILD_TIMEOUT} ]; then
+            echo "❌ Build ${BUILD_NAME} timed out after ${BUILD_TIMEOUT}s"
+            cat /builds/${BUILD_NAME}.log 2>/dev/null || true
+            exit 1
+          fi
+        done
+
+        # ── Check result ─────────────────────────────────────────
+        EXIT_CODE=$(cat /builds/${BUILD_NAME}.exitcode 2>/dev/null || echo "1")
+        if [ "${EXIT_CODE}" != "0" ]; then
+          echo "❌ Build ${BUILD_NAME} failed (exit ${EXIT_CODE}):"
+          cat /builds/${BUILD_NAME}.log 2>/dev/null || true
+          exit 1
+        fi
+
+        echo "✅ Built & pushed ${BUILD_NAME} → ${BUILD_IMAGE}"
