@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Lint & static analysis ───────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go fmt check
+        run: |
+          UNFMT=$(gofmt -l .)
+          if [ -n "$UNFMT" ]; then
+            echo "❌ The following files are not formatted:"
+            echo "$UNFMT"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+  # ── Unit tests (envtest) ─────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: make test
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cover.out
+
+  # ── Build operator + CLI ─────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build operator
+        run: make build
+
+      - name: Build CLI
+        run: make cli
+
+      - name: Build Docker image
+        run: make docker-build
+
+  # ── End-to-end test on a real Kind cluster ───────────────────────────────
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    needs: [lint, test, build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Kind
+        run: |
+          [ -f /usr/local/bin/kind ] || {
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+            chmod +x ./kind
+            sudo mv ./kind /usr/local/bin/kind
+          }
+
+      - name: Run E2E tests
+        run: make e2e
+        env:
+          E2E_CLUSTER_NAME: kindling-e2e-ci
