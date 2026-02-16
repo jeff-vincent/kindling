@@ -28,7 +28,7 @@ sample-app/
 ├── .github/workflows/
 │   └── dev-deploy.yml       # GitHub Actions workflow (uses kindling actions)
 ├── main.go                  # The app — ~100 lines of Go
-├── Dockerfile               # Two-stage build (golang:1.20 → alpine:3.19)
+├── Dockerfile               # Two-stage build (golang:1.25 → alpine:3.19)
 ├── go.mod
 ├── dev-environment.yaml     # DevStagingEnvironment CR (for manual deploy)
 └── README.md                # ← you are here

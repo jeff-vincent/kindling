@@ -8,6 +8,14 @@ rules:
   - ""
   resources:
   - configmaps
+  - persistentvolumeclaims
+  - pods
+  - pods/attach
+  - pods/exec
+  - pods/log
+  - pods/portforward
+  - secrets
+  - serviceaccounts
   - services
   verbs:
   - create
@@ -26,97 +34,10 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  - pods/attach
-  - pods/exec
-  - pods/log
-  - pods/portforward
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - serviceaccounts
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
   - apps
   resources:
   - deployments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
   - replicasets
-  - statefulsets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
   - statefulsets
   verbs:
   - create
@@ -130,31 +51,6 @@ rules:
   - apps.example.com
   resources:
   - devstagingenvironments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps.example.com
-  resources:
-  - devstagingenvironments/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - apps.example.com
-  resources:
-  - devstagingenvironments/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - apps.example.com
-  resources:
   - githubactionrunnerpools
   verbs:
   - create
@@ -167,12 +63,14 @@ rules:
 - apiGroups:
   - apps.example.com
   resources:
+  - devstagingenvironments/finalizers
   - githubactionrunnerpools/finalizers
   verbs:
   - update
 - apiGroups:
   - apps.example.com
   resources:
+  - devstagingenvironments/status
   - githubactionrunnerpools/status
   verbs:
   - get
