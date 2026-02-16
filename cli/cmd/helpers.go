@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -92,12 +93,48 @@ func commandExists(name string) bool {
 	return err == nil
 }
 
-// resolveProjectDir returns the project directory, defaulting to cwd.
+// resolveProjectDir returns the project directory.
+//
+// Resolution order:
+//  1. Explicit --project-dir flag
+//  2. Current working directory (if kind-config.yaml exists there)
+//  3. ~/.kindling (auto-cloned from GitHub if missing)
 func resolveProjectDir() (string, error) {
+	// 1. Explicit flag
 	if projectDir != "" {
 		return projectDir, nil
 	}
-	return os.Getwd()
+
+	// 2. Current directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine working directory: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "kind-config.yaml")); err == nil {
+		return cwd, nil
+	}
+
+	// 3. ~/.kindling (clone if absent)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	cachedDir := filepath.Join(home, ".kindling")
+
+	if _, err := os.Stat(filepath.Join(cachedDir, "kind-config.yaml")); err == nil {
+		// Already cloned — pull latest
+		step("📂", fmt.Sprintf("Using cached project at %s", cachedDir))
+		_ = runDir(cachedDir, "git", "pull", "--ff-only", "-q")
+		return cachedDir, nil
+	}
+
+	// Clone
+	step("📥", "Cloning kindling project to ~/.kindling")
+	if err := run("git", "clone", "--depth=1",
+		"https://github.com/jeff-vincent/kindling.git", cachedDir); err != nil {
+		return "", fmt.Errorf("failed to clone kindling repo to %s: %w", cachedDir, err)
+	}
+	return cachedDir, nil
 }
 
 // clusterExists checks whether a Kind cluster with the given name exists.
