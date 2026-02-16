@@ -74,10 +74,12 @@ e2e: docker-build ## Run end-to-end tests on a dedicated Kind cluster.
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 .PHONY: cli
 cli: ## Build the kindling CLI binary.
-	cd cli && go build -o ../bin/kindling .
-	@echo "✅ bin/kindling built — run: ./bin/kindling --help"
+	cd cli && go build -ldflags "-s -w -X github.com/jeffvincent/kindling/cli/cmd.Version=$(VERSION)" -o ../bin/kindling .
+	@echo "✅ bin/kindling $(VERSION) built — run: ./bin/kindling --help"
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

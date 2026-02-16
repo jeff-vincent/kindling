@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: kindling
+
+builds:
+  - id: kindling-cli
+    dir: cli
+    main: .
+    binary: kindling
+    ldflags:
+      - -s -w
+      - -X github.com/jeffvincent/kindling/cli/cmd.Version={{ .Version }}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: kindling-cli
+    builds:
+      - kindling-cli
+    name_template: "kindling_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: jeff-vincent
+    name: kindling
+  name_template: "v{{ .Version }}"
+  draft: false
+  prerelease: auto
