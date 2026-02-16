@@ -111,8 +111,8 @@ runs:
 
         # Append env if provided
         if [ -n "${DSE_ENV}" ]; then
-          echo "        env:" >> "${YAML_FILE}"
-          echo "${DSE_ENV}" | sed 's/^/          /' >> "${YAML_FILE}"
+          echo "    env:" >> "${YAML_FILE}"
+          echo "${DSE_ENV}" | sed 's/^/      /' >> "${YAML_FILE}"
         fi
 
         cat >> "${YAML_FILE}" <<SVCEOF
@@ -133,8 +133,8 @@ runs:
 
         # Append dependencies if provided
         if [ -n "${DSE_DEPS}" ]; then
-          echo "        dependencies:" >> "${YAML_FILE}"
-          echo "${DSE_DEPS}" | sed 's/^/          /' >> "${YAML_FILE}"
+          echo "  dependencies:" >> "${YAML_FILE}"
+          echo "${DSE_DEPS}" | sed 's/^/    /' >> "${YAML_FILE}"
         fi
 
         echo "📄 Generated DSE:"
