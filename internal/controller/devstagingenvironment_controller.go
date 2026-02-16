@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -44,7 +45,8 @@ import (
 // DevStagingEnvironmentReconciler reconciles a DevStagingEnvironment object
 type DevStagingEnvironmentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 const specHashAnnotation = "apps.example.com/spec-hash"
@@ -77,6 +79,7 @@ func (r *DevStagingEnvironmentReconciler) Reconcile(ctx context.Context, req ctr
 
 	// ── Step 2: Reconcile the Deployment ───────────────────────────────
 	if err := r.reconcileDeployment(ctx, cr); err != nil {
+		r.recordEvent(cr, "Warning", "ReconcileFailed", "Deployment reconciliation failed: %v", err)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "DeploymentReady",
 			Status:  metav1.ConditionFalse,
@@ -89,6 +92,7 @@ func (r *DevStagingEnvironmentReconciler) Reconcile(ctx context.Context, req ctr
 
 	// ── Step 3: Reconcile the Service ──────────────────────────────────
 	if err := r.reconcileService(ctx, cr); err != nil {
+		r.recordEvent(cr, "Warning", "ReconcileFailed", "Service reconciliation failed: %v", err)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "ServiceReady",
 			Status:  metav1.ConditionFalse,
@@ -101,6 +105,7 @@ func (r *DevStagingEnvironmentReconciler) Reconcile(ctx context.Context, req ctr
 
 	// ── Step 4: Reconcile the Ingress (if enabled) ─────────────────────
 	if err := r.reconcileIngress(ctx, cr); err != nil {
+		r.recordEvent(cr, "Warning", "ReconcileFailed", "Ingress reconciliation failed: %v", err)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "IngressReady",
 			Status:  metav1.ConditionFalse,
@@ -113,6 +118,7 @@ func (r *DevStagingEnvironmentReconciler) Reconcile(ctx context.Context, req ctr
 
 	// ── Step 5: Reconcile Dependencies (databases, caches, etc.) ──────
 	if err := r.reconcileDependencies(ctx, cr); err != nil {
+		r.recordEvent(cr, "Warning", "ReconcileFailed", "Dependencies reconciliation failed: %v", err)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "DependenciesReady",
 			Status:  metav1.ConditionFalse,
@@ -129,6 +135,7 @@ func (r *DevStagingEnvironmentReconciler) Reconcile(ctx context.Context, req ctr
 	}
 
 	logger.Info("Reconciliation complete")
+	r.recordEvent(cr, "Normal", "ReconcileComplete", "All resources reconciled successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -207,13 +214,16 @@ func (r *DevStagingEnvironmentReconciler) buildDeployment(cr *appsv1alpha1.DevSt
 		container.ReadinessProbe = probe.DeepCopy()
 	}
 
+	// Build init containers that wait for each dependency to accept TCP connections
+	initContainers := buildDependencyWaitInitContainers(cr)
+
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cr.Name,
 			Namespace: cr.Namespace,
 			Labels:    labels,
 			Annotations: map[string]string{
-				specHashAnnotation: computeSpecHash(cr.Spec.Deployment),
+				specHashAnnotation: computeSpecHash(cr.Spec),
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -226,7 +236,8 @@ func (r *DevStagingEnvironmentReconciler) buildDeployment(cr *appsv1alpha1.DevSt
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{container},
+					InitContainers: initContainers,
+					Containers:     []corev1.Container{container},
 				},
 			},
 		},
@@ -593,6 +604,7 @@ func computeSpecHash(obj interface{}) string {
 // and Ingresses that the operator owns, so changes to child resources
 // trigger a reconciliation of the parent CR.
 func (r *DevStagingEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("devstagingenvironment-controller")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.DevStagingEnvironment{}).
 		Owns(&appsv1.Deployment{}).
@@ -600,6 +612,15 @@ func (r *DevStagingEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) err
 		Owns(&corev1.Secret{}).
 		Owns(&networkingv1.Ingress{}).
 		Complete(r)
+}
+
+// recordEvent safely emits a Kubernetes Event on the CR. It is a no-op when
+// the Recorder has not been initialised (e.g. in unit tests that don't use a
+// full manager).
+func (r *DevStagingEnvironmentReconciler) recordEvent(cr *appsv1alpha1.DevStagingEnvironment, eventType, reason, messageFmt string, args ...interface{}) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cr, eventType, reason, messageFmt, args...)
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -776,6 +797,52 @@ func dependencyName(crName string, depType appsv1alpha1.DependencyType) string {
 	return fmt.Sprintf("%s-%s", crName, string(depType))
 }
 
+// buildDependencyWaitInitContainers creates one init container per dependency
+// that blocks until the dependency service is accepting TCP connections. This
+// prevents the app container from crashing on startup because a database or
+// queue isn't ready yet.
+func buildDependencyWaitInitContainers(cr *appsv1alpha1.DevStagingEnvironment) []corev1.Container {
+	if len(cr.Spec.Dependencies) == 0 {
+		return nil
+	}
+
+	var initContainers []corev1.Container
+	for _, dep := range cr.Spec.Dependencies {
+		defaults, ok := dependencyRegistry[dep.Type]
+		if !ok {
+			continue
+		}
+
+		svcName := dependencyName(cr.Name, dep.Type)
+		port := defaults.Port
+		if dep.Port != nil {
+			port = *dep.Port
+		}
+
+		// Use busybox to do a TCP probe in a loop until the service is reachable
+		script := fmt.Sprintf(
+			`echo "Waiting for %s at %s:%d..."
+until nc -z -w2 %s %d; do
+  echo "  %s not ready, retrying in 2s..."
+  sleep 2
+done
+echo "%s is ready!"`,
+			dep.Type, svcName, port,
+			svcName, port,
+			dep.Type,
+			dep.Type,
+		)
+
+		initContainers = append(initContainers, corev1.Container{
+			Name:    fmt.Sprintf("wait-for-%s", dep.Type),
+			Image:   "busybox:1.36",
+			Command: []string{"/bin/sh", "-c", script},
+		})
+	}
+
+	return initContainers
+}
+
 // reconcileDependencies processes each declared dependency: creates a Secret
 // (with credentials), a Deployment, and a Service.
 func (r *DevStagingEnvironmentReconciler) reconcileDependencies(ctx context.Context, cr *appsv1alpha1.DevStagingEnvironment) error {
@@ -803,6 +870,76 @@ func (r *DevStagingEnvironmentReconciler) reconcileDependencies(ctx context.Cont
 		}
 
 		logger.Info("Dependency reconciled", "type", dep.Type, "name", dependencyName(cr.Name, dep.Type))
+	}
+
+	// 4. Prune stale dependencies — if a dep was removed from the spec,
+	//    delete its Deployment, Service, and Secret.
+	if err := r.pruneOrphanedDependencies(ctx, cr); err != nil {
+		return fmt.Errorf("prune orphaned dependencies: %w", err)
+	}
+
+	return nil
+}
+
+// pruneOrphanedDependencies deletes Deployments, Services, and Secrets for
+// dependencies that were removed from the CR spec. It finds all child
+// Deployments labelled as managed by this CR and deletes any whose dependency
+// type is no longer in cr.Spec.Dependencies.
+func (r *DevStagingEnvironmentReconciler) pruneOrphanedDependencies(ctx context.Context, cr *appsv1alpha1.DevStagingEnvironment) error {
+	logger := log.FromContext(ctx)
+
+	// Build a set of dependency types currently declared in the spec
+	wantedTypes := make(map[string]bool, len(cr.Spec.Dependencies))
+	for _, dep := range cr.Spec.Dependencies {
+		wantedTypes[string(dep.Type)] = true
+	}
+
+	// List all Deployments that belong to this CR's dependencies
+	depDeployments := &appsv1.DeploymentList{}
+	if err := r.List(ctx, depDeployments,
+		client.InNamespace(cr.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/part-of":    cr.Name,
+			"app.kubernetes.io/managed-by": "devstagingenvironment-operator",
+		},
+	); err != nil {
+		return err
+	}
+
+	for i := range depDeployments.Items {
+		dep := &depDeployments.Items[i]
+		component := dep.Labels["app.kubernetes.io/component"]
+		if component == "" {
+			continue // not a dependency resource
+		}
+		if wantedTypes[component] {
+			continue // still declared in the spec
+		}
+
+		logger.Info("Pruning orphaned dependency Deployment", "name", dep.Name, "type", component)
+		if err := r.Delete(ctx, dep); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+
+		// Also delete the corresponding Service
+		svc := &corev1.Service{}
+		svcKey := types.NamespacedName{Name: dep.Name, Namespace: cr.Namespace}
+		if err := r.Get(ctx, svcKey, svc); err == nil {
+			logger.Info("Pruning orphaned dependency Service", "name", svc.Name)
+			if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
+				return err
+			}
+		}
+
+		// Also delete the corresponding credentials Secret
+		secret := &corev1.Secret{}
+		secretKey := types.NamespacedName{Name: dep.Name + "-credentials", Namespace: cr.Namespace}
+		if err := r.Get(ctx, secretKey, secret); err == nil {
+			logger.Info("Pruning orphaned dependency Secret", "name", secret.Name)
+			if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
+				return err
+			}
+		}
 	}
 
 	return nil

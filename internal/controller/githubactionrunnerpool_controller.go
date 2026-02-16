@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -42,7 +43,8 @@ import (
 // GithubActionRunnerPoolReconciler reconciles a GithubActionRunnerPool object.
 type GithubActionRunnerPoolReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 const runnerPoolHashAnnotation = "apps.example.com/runner-pool-spec-hash"
@@ -82,6 +84,7 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 
 	// ── Step 2: Validate the CR ────────────────────────────────────────
 	if cr.Spec.GitHubUsername == "" || cr.Spec.Repository == "" {
+		r.recordEvent(cr, "Warning", "InvalidSpec", "Both spec.githubUsername and spec.repository must be set")
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "Ready",
 			Status:  metav1.ConditionFalse,
@@ -99,6 +102,7 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 		Namespace: cr.Namespace,
 	}
 	if err := r.Get(ctx, secretKey, tokenSecret); err != nil {
+		r.recordEvent(cr, "Warning", "SecretNotFound", "Token secret %q not found", cr.Spec.TokenSecretRef.Name)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "Ready",
 			Status:  metav1.ConditionFalse,
@@ -112,6 +116,7 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 	// ── Step 4: Reconcile RBAC for the runner pod ──────────────────────
 	// The runner pod needs kubectl access to create Kaniko pods, apply CRs, etc.
 	if err := r.reconcileRunnerRBAC(ctx, cr); err != nil {
+		r.recordEvent(cr, "Warning", "RBACFailed", "Failed to reconcile runner RBAC: %v", err)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "Ready",
 			Status:  metav1.ConditionFalse,
@@ -124,6 +129,7 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 
 	// ── Step 5: Reconcile the runner Deployment ────────────────────────
 	if err := r.reconcileRunnerDeployment(ctx, cr); err != nil {
+		r.recordEvent(cr, "Warning", "ReconcileFailed", "Runner deployment reconciliation failed: %v", err)
 		meta.SetStatusCondition(&cr.Status.Conditions, metav1.Condition{
 			Type:    "DeploymentReady",
 			Status:  metav1.ConditionFalse,
@@ -140,6 +146,7 @@ func (r *GithubActionRunnerPoolReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	logger.Info("Reconciliation complete for runner pool")
+	r.recordEvent(cr, "Normal", "ReconcileComplete", "Runner pool reconciled successfully for %s", cr.Spec.GitHubUsername)
 	return ctrl.Result{}, nil
 }
 
@@ -792,8 +799,16 @@ func githubAPIURL(githubURL string) string {
 // SetupWithManager sets up the controller with the Manager.
 // It watches GithubActionRunnerPool (primary) and Deployments that it owns.
 func (r *GithubActionRunnerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("githubactionrunnerpool-controller")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.GithubActionRunnerPool{}).
 		Owns(&appsv1.Deployment{}).
 		Complete(r)
+}
+
+// recordEvent safely emits a Kubernetes Event on the CR.
+func (r *GithubActionRunnerPoolReconciler) recordEvent(cr *appsv1alpha1.GithubActionRunnerPool, eventType, reason, messageFmt string, args ...interface{}) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cr, eventType, reason, messageFmt, args...)
+	}
 }
