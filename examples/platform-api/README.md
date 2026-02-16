@@ -5,133 +5,178 @@ five backing services — all auto-provisioned by the operator. The API
 connects to PostgreSQL, Redis, Elasticsearch, Kafka, and Vault; the
 dashboard gives you a real-time view of every service's health.
 
-```
-                                ┌───────────────┐
-                           ┌───▶│ PostgreSQL 16 │
-                           │    └───────────────┘
-                           │    ┌───────────────┐
-                           ├───▶│  Redis        │
- ┌──────────────┐          │    └───────────────┘
- │ platform-ui  │  /api/*  │    ┌───────────────┐
- │ (React+nginx)├─────────▶├───▶│ Elasticsearch │
- │  :80         │          │    └───────────────┘
- └──────────────┘   ┌──────┴──┐ ┌───────────────┐
-                    │platform- ├▶│  Kafka        │
-                    │api :8080 │ └───────────────┘
-                    └──────┬──┘ ┌───────────────┐
-                           └───▶│  Vault (dev)  │
-                                └───────────────┘
+## Architecture
+
+```mermaid
+flowchart LR
+    user(("👩‍💻 Developer"))
+
+    subgraph cluster["⎈  Kind Cluster"]
+        ui["🖥️ platform-ui\n:80\n<i>React + nginx</i>"]
+        api["🔷 platform-api\n:8080\n<i>Go</i>"]
+
+        pg[("🐘 Postgres 16")]
+        rd[("⚡ Redis")]
+        es[("🔍 Elasticsearch")]
+        kafka[("📨 Kafka")]
+        vault[("🔐 Vault")]
+
+        ui -- "/api/*" --> api
+        api --> pg
+        api --> rd
+        api --> es
+        api --> kafka
+        api --> vault
+    end
+
+    user -- "http://<user>-platform-ui.localhost" --> ui
+    user -. "http://<user>-platform-api.localhost" .-> api
+
+    style cluster fill:#0f3460,stroke:#326CE5,color:#e0e0e0,stroke-width:2px
+    style ui fill:#6e40c9,stroke:#6e40c9,color:#fff
+    style api fill:#326CE5,stroke:#326CE5,color:#fff
+    style pg fill:#336791,stroke:#336791,color:#fff
+    style rd fill:#DC382D,stroke:#DC382D,color:#fff
+    style es fill:#FEC514,stroke:#FEC514,color:#000
+    style kafka fill:#231F20,stroke:#231F20,color:#fff
+    style vault fill:#000,stroke:#FFCB2D,color:#FFCB2D
+    style user fill:#6e40c9,stroke:#6e40c9,color:#fff
 ```
 
 ## What you get
 
 | URL | Description |
 |---|---|
-| `http://platform-ui.localhost` | 🖥️ **Dashboard** — live status of all 5 services |
-| `http://platform-api.localhost/` | API hello message |
-| `http://platform-api.localhost/healthz` | Liveness probe |
-| `http://platform-api.localhost/status` | Raw JSON — pings all 5 deps |
+| `http://<user>-platform-ui.localhost` | 🖥️ **Dashboard** — live status of all 5 services |
+| `http://<user>-platform-api.localhost/` | API hello message |
+| `http://<user>-platform-api.localhost/healthz` | Liveness probe |
+| `http://<user>-platform-api.localhost/status` | Raw JSON — pings all 5 deps |
 
 The dashboard auto-refreshes every 5 seconds and shows:
 - Status cards for each service with connection details
 - Per-service uptime sparklines
 - Event log tracking connect/disconnect state changes
-- Quick links to API endpoints
 
 ## Files
 
 ```
 platform-api/
+├── .github/workflows/
+│   └── dev-deploy.yml             # GitHub Actions workflow (uses kindling actions)
 ├── main.go                        # Go API (~210 lines)
 ├── Dockerfile                     # Two-stage build (golang → alpine)
-├── go.mod / go.sum                # Go dependencies
+├── go.mod
 ├── dev-environment.yaml           # 2 DevStagingEnvironment CRs
-├── .github/workflows/
-│   └── dev-deploy.yml             # GitHub Actions workflow
 ├── ui/
 │   ├── src/
 │   │   ├── App.tsx                # React dashboard component
 │   │   ├── App.css                # Dark theme styles
-│   │   ├── main.tsx               # Entry point
-│   │   └── vite-env.d.ts
-│   ├── public/favicon.svg
-│   ├── index.html
+│   │   └── main.tsx               # Entry point
 │   ├── Dockerfile                 # node:20 → nginx:1.25
 │   ├── nginx.conf.template        # Proxies /api/* → platform-api
 │   ├── entrypoint.sh              # envsubst for API_URL
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── vite.config.ts
-└── README.md                      # ← you are here
+└── README.md
+```
+
+## GitHub Actions Workflow
+
+The included workflow uses the **reusable kindling actions** — two
+builds and two deploys in ~100 lines:
+
+```yaml
+# Simplified — see .github/workflows/dev-deploy.yml for the full file
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Clean builds directory
+    run: rm -f /builds/*
+
+  # Build both images
+  - name: Build API
+    uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+    with:
+      name: platform-api
+      context: ${{ github.workspace }}
+      image: "registry:5000/platform-api:${{ env.TAG }}"
+      exclude: "./ui"
+
+  - name: Build UI
+    uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+    with:
+      name: platform-api-ui
+      context: "${{ github.workspace }}/ui"
+      image: "registry:5000/platform-api-ui:${{ env.TAG }}"
+
+  # Deploy with 5 dependencies — the operator handles all of them
+  - name: Deploy API
+    uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+    with:
+      name: "${{ github.actor }}-platform-api"
+      image: "registry:5000/platform-api:${{ env.TAG }}"
+      port: "8080"
+      ingress-host: "${{ github.actor }}-platform-api.localhost"
+      dependencies: |
+        - type: postgres
+          version: "16"
+        - type: redis
+        - type: elasticsearch
+        - type: kafka
+        - type: vault
+
+  - name: Deploy UI
+    uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+    with:
+      name: "${{ github.actor }}-platform-api-ui"
+      image: "registry:5000/platform-api-ui:${{ env.TAG }}"
+      port: "80"
+      health-check-path: "/"
+      env: |
+        - name: API_URL
+          value: "http://${{ github.actor }}-platform-api:8080"
+      ingress-host: "${{ github.actor }}-platform-ui.localhost"
 ```
 
 ## Quick-start
 
 ### Prerequisites
 
-- Local Kind cluster created with `kind-config.yaml`
-- **kindling** operator deployed ([Getting Started](../../README.md#getting-started))
-- `setup-ingress.sh` run (deploys registry + ingress-nginx)
+- Local Kind cluster with **kindling** operator deployed ([Getting Started](../../README.md#getting-started))
+- `GithubActionRunnerPool` CR applied with your GitHub username
 
 ### Option A — Push to GitHub (CI flow)
 
-If you have a `GithubActionRunnerPool` running, copy this example into
-your target repo. The included `.github/workflows/dev-deploy.yml` will:
+```bash
+mkdir my-platform && cd my-platform && git init
+cp -r /path/to/kindling/examples/platform-api/* .
+cp -r /path/to/kindling/examples/platform-api/.github .
 
-1. Build the API image via Kaniko
-2. Build the UI image via Kaniko
-3. Push both to `registry:5000`
-4. Apply two `DevStagingEnvironment` CRs (API + UI)
-5. Wait for rollout
-6. Smoke-test both `/healthz` and the dashboard
+git remote add origin git@github.com:you/my-platform.git
+git add -A && git commit -m "initial commit" && git push -u origin main
+```
 
-Just `git push` and the runner handles everything.
-
-### Option B — Deploy manually (no GitHub)
+### Option B — Deploy manually
 
 ```bash
-# 1. Build and load both images into Kind
 docker build -t platform-api:dev examples/platform-api/
 docker build -t platform-api-ui:dev examples/platform-api/ui/
 kind load docker-image platform-api:dev --name dev
 kind load docker-image platform-api-ui:dev --name dev
-
-# 2. Apply both DevStagingEnvironment CRs
 kubectl apply -f examples/platform-api/dev-environment.yaml
-
-# 3. Wait for rollout (longer timeout — 5 backing services to provision)
 kubectl rollout status deployment/platform-api-dev --timeout=180s
-kubectl rollout status deployment/platform-api-ui-dev --timeout=120s
 ```
 
 ### Try it out
 
-With ingress-nginx running:
-
 ```bash
 # Open the dashboard
-open http://platform-ui.localhost
+open http://<user>-platform-ui.localhost
 
-# Or hit the API directly
-curl http://platform-api.localhost/
-curl http://platform-api.localhost/healthz
-curl http://platform-api.localhost/status | jq .
+# Or hit the API
+curl http://<user>-platform-api.localhost/status | jq .
 ```
-
-<details>
-<summary><strong>Without Ingress (port-forward fallback)</strong></summary>
-
-```bash
-# API
-kubectl port-forward svc/platform-api-dev 8080:8080
-curl localhost:8080/status | jq .
-
-# UI
-kubectl port-forward svc/platform-api-ui-dev 3000:80
-open http://localhost:3000
-```
-
-</details>
 
 Expected `/status` output:
 
@@ -147,47 +192,34 @@ Expected `/status` output:
 }
 ```
 
-## What the operator creates for you
+## What the operator creates
 
 When you apply the two `DevStagingEnvironment` CRs, the kindling operator
-auto-provisions:
+auto-provisions **11 Kubernetes resources** from two small YAML blocks:
 
 | Resource | Description |
 |---|---|
 | **API Deployment** | Go API container with health checks |
-| **API Service** (ClusterIP) | Internal routing to the API |
-| **API Ingress** | `platform-api.localhost` → API |
+| **API Service + Ingress** | `<user>-platform-api.localhost` |
 | **UI Deployment** | nginx serving the React SPA |
-| **UI Service** (ClusterIP) | Internal routing to the dashboard |
-| **UI Ingress** | `platform-ui.localhost` → dashboard |
+| **UI Service + Ingress** | `<user>-platform-ui.localhost` |
 | **Postgres 16** | Pod + Service, `DATABASE_URL` injected |
 | **Redis** | Pod + Service, `REDIS_URL` injected |
-| **Elasticsearch 8** | Pod + Service, `ELASTICSEARCH_URL` injected |
+| **Elasticsearch** | Pod + Service, `ELASTICSEARCH_URL` injected |
 | **Kafka** (KRaft) | Pod + Service, `KAFKA_BROKER_URL` injected |
 | **Vault** (dev) | Pod + Service, `VAULT_ADDR` + `VAULT_TOKEN` injected |
 
-That's **11 Kubernetes resources** from two small YAML blocks. You write
-zero infrastructure YAML for the backing services.
-
 ## Local UI development
 
-To develop the dashboard locally with hot reload:
-
 ```bash
-# Start the API (or port-forward to an existing one)
 cd examples/platform-api && go run .
-
-# In another terminal, start the Vite dev server
 cd examples/platform-api/ui && npm install && npm run dev
 ```
 
-Vite proxies `/api/*` to `localhost:8080` automatically — see
-`vite.config.ts`.
+Vite proxies `/api/*` to `localhost:8080` — see `vite.config.ts`.
 
 ## Cleaning up
 
 ```bash
-kubectl delete devstagingenvironment platform-api-dev platform-api-ui-dev
+kubectl delete devstagingenvironment <user>-platform-api <user>-platform-api-ui
 ```
-
-The operator garbage-collects all owned resources automatically.

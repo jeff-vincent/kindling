@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -20,14 +21,30 @@ This is the equivalent of running:
   ./setup-ingress.sh
   make docker-build IMG=controller:latest
   kind load docker-image controller:latest --name dev
-  make install deploy IMG=controller:latest`,
+  make install deploy IMG=controller:latest
+
+Optional flags are passed through to "kind create cluster":
+  --image        Node image to use (e.g. kindest/node:v1.29.0)
+  --kubeconfig   Path to write kubeconfig (default: $KUBECONFIG or ~/.kube/config)
+  --wait         Wait for control plane to be ready (e.g. 60s, 5m)
+  --retain       Retain nodes for debugging if cluster creation fails`,
 	RunE: runInit,
 }
 
-var skipCluster bool
+var (
+	skipCluster    bool
+	kindNodeImage  string
+	kindKubeconfig string
+	kindWait       string
+	kindRetain     bool
+)
 
 func init() {
 	initCmd.Flags().BoolVar(&skipCluster, "skip-cluster", false, "Skip Kind cluster creation (use existing cluster)")
+	initCmd.Flags().StringVar(&kindNodeImage, "image", "", "Node Docker image for Kind (e.g. kindest/node:v1.29.0)")
+	initCmd.Flags().StringVar(&kindKubeconfig, "kubeconfig", "", "Path to write kubeconfig instead of default location")
+	initCmd.Flags().StringVar(&kindWait, "wait", "", "Wait for control plane to be ready (e.g. 60s, 5m)")
+	initCmd.Flags().BoolVar(&kindRetain, "retain", false, "Retain cluster nodes for debugging on creation failure")
 	rootCmd.AddCommand(initCmd)
 }
 
@@ -67,11 +84,26 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if clusterExists(clusterName) {
 			warn(fmt.Sprintf("Cluster %q already exists — skipping creation", clusterName))
 		} else {
-			step("🔧", fmt.Sprintf("kind create cluster --name %s", clusterName))
-			if err := runDir(dir, "kind", "create", "cluster",
+			kindArgs := []string{
+				"create", "cluster",
 				"--name", clusterName,
 				"--config", configPath,
-			); err != nil {
+			}
+			if kindNodeImage != "" {
+				kindArgs = append(kindArgs, "--image", kindNodeImage)
+			}
+			if kindKubeconfig != "" {
+				kindArgs = append(kindArgs, "--kubeconfig", kindKubeconfig)
+			}
+			if kindWait != "" {
+				kindArgs = append(kindArgs, "--wait", kindWait)
+			}
+			if kindRetain {
+				kindArgs = append(kindArgs, "--retain")
+			}
+
+			step("🔧", fmt.Sprintf("kind %s", strings.Join(kindArgs, " ")))
+			if err := runDir(dir, "kind", kindArgs...); err != nil {
 				return fmt.Errorf("failed to create Kind cluster: %w", err)
 			}
 			success("Kind cluster created")
