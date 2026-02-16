@@ -1,185 +1,69 @@
 # ─────────────────────────────────────────────────────────────────
-# dev-deploy.yml — Build your app and deploy it to your local Kind
+# dev-deploy.yml — Build and deploy sample-app to your local Kind
 # cluster via kindling.
 #
-# This workflow runs on your SELF-HOSTED runner (created by the
-# GithubActionRunnerPool CR). It uses Kaniko to build a container
-# image and pushes it to the in-cluster registry at registry:5000.
-# It then applies a DevStagingEnvironment CR — the kindling operator
-# provisions Postgres, Redis, Deployment, Service, and Ingress.
+# Uses reusable kindling actions:
+#   - kindling-build:  Kaniko image build via sidecar
+#   - kindling-deploy: DSE apply + rollout wait via sidecar
 #
-# No Docker daemon required — Kaniko builds in userspace pods.
+# This is the simplest possible workflow — a single service with
+# two dependencies (Postgres + Redis).
 # ─────────────────────────────────────────────────────────────────
 name: Dev Deploy
 
 on:
   push:
     branches: [main]
-    paths:
-      - "**"
-      - ".github/workflows/dev-deploy.yml"
-  workflow_dispatch: # allow manual triggers for testing
+  workflow_dispatch:
+
+env:
+  REGISTRY: "registry:5000"
+  TAG: "${{ github.actor }}-${{ github.sha }}"
 
 jobs:
   build-and-deploy:
-    # Route this job to the developer's own laptop via their username label.
-    # The GithubActionRunnerPool operator auto-registers [self-hosted, <username>].
     runs-on: [self-hosted, "${{ github.actor }}"]
 
-    env:
-      APP_NAME: sample-app
-      TAG: "${{ github.actor }}-${{ github.sha }}"
-      REGISTRY: "registry:5000"
-
     steps:
-      # ── 0. Clean shared /builds dir from any previous run ────────
-      #
-      # The /builds emptyDir persists across workflow runs (same pod).
-      # Stale .done / .apply-done files from a previous run would
-      # cause every wait-loop to exit immediately.
-      #
-      - name: Clean builds directory
-        run: |
-          echo "🧹 Cleaning stale signal files from /builds..."
-          rm -f /builds/*.done /builds/*.request /builds/*.processing \
-                /builds/*.apply /builds/*.apply-done /builds/*.apply-log \
-                /builds/*.apply-exitcode /builds/*.kubectl \
-                /builds/*.kubectl-done /builds/*.kubectl-log \
-                /builds/*.kubectl-exitcode /builds/*.exitcode \
-                /builds/*.log /builds/*.dest /builds/*.tar.gz \
-                /builds/*.yaml /builds/*.sh /builds/portfwd-ready \
-                /builds/portfwd-stop
-          echo "✅ /builds is clean"
-
-      # ── 1. Checkout ──────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Build image via the build-agent sidecar ───────────────
-      #
-      # The runner pod has a build-agent sidecar with kubectl that
-      # watches /builds for requests. We:
-      #   1. tar up the build context → /builds/<name>.tar.gz
-      #   2. write the destination   → /builds/<name>.dest
-      #   3. touch the trigger       → /builds/<name>.request
-      #   4. wait for               → /builds/<name>.done
-      # The sidecar pipes the tarball into a one-shot Kaniko pod.
-      #
-      - name: Build & push image via Kaniko
+      - name: Clean builds directory
+        shell: bash
         run: |
-          tar -czf /builds/$APP_NAME.tar.gz -C ${{ github.workspace }} .
-          echo "$REGISTRY/$APP_NAME:$TAG" > /builds/$APP_NAME.dest
-          touch /builds/$APP_NAME.request
-          echo "⏳ Waiting for Kaniko build..."
-          while [ ! -f /builds/$APP_NAME.done ]; do sleep 2; done
-          EXIT_CODE=$(cat /builds/$APP_NAME.exitcode)
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ Build failed:"; cat /builds/$APP_NAME.log; exit 1
-          fi
-          echo "✅ Built & pushed $APP_NAME:$TAG"
+          rm -f /builds/*.done /builds/*.request /builds/*.processing \
+                /builds/*.apply /builds/*.apply-done /builds/*.apply-log \
+                /builds/*.apply-exitcode /builds/*.exitcode \
+                /builds/*.log /builds/*.dest /builds/*.tar.gz \
+                /builds/*.yaml /builds/*.sh
 
-      # ── 3. Deploy DevStagingEnvironment CR via sidecar ───────────
-      - name: Deploy to local Kind cluster
+      # ── Build ────────────────────────────────────────────────────
+      - name: Build image
+        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+        with:
+          name: sample-app
+          context: ${{ github.workspace }}
+          image: "${{ env.REGISTRY }}/sample-app:${{ env.TAG }}"
+
+      # ── Deploy ───────────────────────────────────────────────────
+      - name: Deploy
+        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+        with:
+          name: "${{ github.actor }}-sample-app"
+          image: "${{ env.REGISTRY }}/sample-app:${{ env.TAG }}"
+          port: "8080"
+          labels: |
+            app.kubernetes.io/part-of: sample-app
+            apps.example.com/github-username: ${{ github.actor }}
+          ingress-host: "${{ github.actor }}-sample-app.localhost"
+          dependencies: |
+            - type: postgres
+              version: "16"
+            - type: redis
+
+      # ── Done ─────────────────────────────────────────────────────
+      - name: Summary
         run: |
-          cat > /builds/$APP_NAME-dse.yaml <<EOF
-          apiVersion: apps.example.com/v1alpha1
-          kind: DevStagingEnvironment
-          metadata:
-            name: ${{ github.actor }}-$APP_NAME
-            labels:
-              app.kubernetes.io/part-of: $APP_NAME
-              apps.example.com/github-username: ${{ github.actor }}
-          spec:
-            deployment:
-              image: $REGISTRY/$APP_NAME:$TAG
-              replicas: 1
-              port: 8080
-              healthCheck:
-                path: /healthz
-            service:
-              port: 8080
-              type: ClusterIP
-            ingress:
-              enabled: true
-              host: ${{ github.actor }}-$APP_NAME.localhost
-              ingressClassName: nginx
-            dependencies:
-              - type: postgres
-                version: "16"
-              - type: redis
-          EOF
-          touch /builds/$APP_NAME-dse.apply
-          while [ ! -f /builds/$APP_NAME-dse.apply-done ]; do sleep 1; done
-          EXIT_CODE=$(cat /builds/$APP_NAME-dse.apply-exitcode)
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ Deploy failed:"; cat /builds/$APP_NAME-dse.apply-log; exit 1
-          fi
-          echo "✅ DevStagingEnvironment applied — operator will reconcile"
-
-      # ── 4. Wait for rollout via sidecar ──────────────────────────
-      - name: Wait for deployment rollout
-        run: |
-          ACTOR="${{ github.actor }}"
-          cat > /builds/rollout-wait.sh <<SCRIPT
-          #!/bin/bash
-          echo "⏳ Waiting for ${ACTOR}-$APP_NAME deployment..."
-          kubectl rollout status deployment/${ACTOR}-$APP_NAME \
-            --timeout=120s || true
-
-          echo ""
-          echo "📦 Pods:"
-          kubectl get pods -l app.kubernetes.io/part-of=$APP_NAME
-
-          echo ""
-          echo "🌐 Services:"
-          kubectl get svc | grep -E "${ACTOR}-($APP_NAME|.*postgres|.*redis)"
-
-          echo ""
-          echo "🎯 DevStagingEnvironment:"
-          kubectl get devstagingenvironments ${ACTOR}-$APP_NAME
-          SCRIPT
-          chmod +x /builds/rollout-wait.sh
-          touch /builds/rollout-wait.kubectl
-          while [ ! -f /builds/rollout-wait.kubectl-done ]; do sleep 2; done
-          cat /builds/rollout-wait.kubectl-log
-          EXIT_CODE=$(cat /builds/rollout-wait.kubectl-exitcode)
-          [ "$EXIT_CODE" = "0" ] || exit 1
-
-      # ── 5. Smoke test via sidecar ────────────────────────────────
-      - name: Smoke test
-        run: |
-          cat > /builds/smoke-portfwd.sh <<SCRIPT
-          #!/bin/bash
-          kubectl port-forward svc/${{ github.actor }}-$APP_NAME 18080:8080 &
-          PF_PID=\$!
-          sleep 3
-          touch /builds/portfwd-ready
-          while [ ! -f /builds/portfwd-stop ]; do sleep 1; done
-          kill \$PF_PID 2>/dev/null || true
-          SCRIPT
-          chmod +x /builds/smoke-portfwd.sh
-          touch /builds/smoke-portfwd.kubectl
-          while [ ! -f /builds/portfwd-ready ]; do sleep 1; done
-
-          echo "── Health check ───────────────────────"
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18080/healthz)
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ Health check passed"
-          else
-            echo "❌ Health check failed (HTTP $HTTP_CODE)"
-            touch /builds/portfwd-stop
-            while [ ! -f /builds/smoke-portfwd.kubectl-done ]; do sleep 1; done
-            exit 1
-          fi
-
-          echo ""
-          echo "── Status (DB connectivity) ───────────"
-          curl -sf http://localhost:18080/status | jq . || echo "(not available)"
-
-          touch /builds/portfwd-stop
-          while [ ! -f /builds/smoke-portfwd.kubectl-done ]; do sleep 1; done
-
-          echo ""
           echo "🎉 Deploy complete!"
-          echo "🌐 Access via: http://${{ github.actor }}-$APP_NAME.localhost"
-          echo "📡 Fallback:   kubectl port-forward svc/${{ github.actor }}-$APP_NAME 8080:8080"
+          echo ""
+          echo "🌐 http://${{ github.actor }}-sample-app.localhost"
