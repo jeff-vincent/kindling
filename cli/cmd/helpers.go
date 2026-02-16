@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -149,4 +150,49 @@ func clusterExists(name string) bool {
 		}
 	}
 	return false
+}
+
+// runStdin executes a command with the given string piped to stdin.
+func runStdin(input, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// ensureKustomize downloads kustomize to <dir>/bin/ if not already present
+// and returns the path to the binary.
+func ensureKustomize(dir string) (string, error) {
+	binDir := filepath.Join(dir, "bin")
+	kustomizePath := filepath.Join(binDir, "kustomize")
+
+	if info, err := os.Stat(kustomizePath); err == nil && !info.IsDir() {
+		return kustomizePath, nil
+	}
+
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return "", fmt.Errorf("cannot create bin dir: %w", err)
+	}
+
+	osName := runtime.GOOS   // linux or darwin
+	arch := runtime.GOARCH    // amd64 or arm64
+
+	version := "v5.5.0"
+	url := fmt.Sprintf(
+		"https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%%2F%s/kustomize_%s_%s_%s.tar.gz",
+		version, version, osName, arch,
+	)
+
+	step("📥", fmt.Sprintf("Downloading kustomize %s", version))
+	// Download and extract in one shot: curl | tar
+	tarCmd := exec.Command("bash", "-c",
+		fmt.Sprintf("curl -sL '%s' | tar xz -C '%s'", url, binDir))
+	tarCmd.Stdout = os.Stdout
+	tarCmd.Stderr = os.Stderr
+	if err := tarCmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to download kustomize: %w", err)
+	}
+
+	return kustomizePath, nil
 }

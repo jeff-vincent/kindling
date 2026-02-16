@@ -58,7 +58,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	header("Preflight checks")
 
 	missing := []string{}
-	for _, tool := range []string{"kind", "kubectl", "docker", "make", "go"} {
+	for _, tool := range []string{"kind", "kubectl", "docker"} {
 		if commandExists(tool) {
 			step("✓", fmt.Sprintf("%s found", tool))
 		} else {
@@ -133,8 +133,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	// ── Build the operator image ────────────────────────────────
 	header("Building kindling operator image")
 
-	step("🏗️ ", "make docker-build IMG=controller:latest")
-	if err := runDir(dir, "make", "docker-build", "IMG=controller:latest"); err != nil {
+	step("🏗️ ", "docker build -t controller:latest")
+	if err := runDir(dir, "docker", "build", "-t", "controller:latest", "."); err != nil {
 		return fmt.Errorf("operator image build failed: %w", err)
 	}
 	success("Operator image built")
@@ -146,19 +146,40 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	success("Image loaded")
 
+	// ── Ensure kustomize is available ───────────────────────────
+	kustomizeBin, err := ensureKustomize(dir)
+	if err != nil {
+		return fmt.Errorf("failed to set up kustomize: %w", err)
+	}
+
 	// ── Install CRDs ────────────────────────────────────────────
 	header("Installing CRDs + deploying operator")
 
-	step("📜", "make install")
-	if err := runDir(dir, "make", "install"); err != nil {
+	step("📜", "Applying CRDs")
+	crdDir := filepath.Join(dir, "config", "crd", "bases")
+	if err := run("kubectl", "apply", "-f", crdDir); err != nil {
 		return fmt.Errorf("CRD installation failed: %w", err)
 	}
+	success("CRDs installed")
 
 	// ── Deploy operator ─────────────────────────────────────────
-	step("🚀", "make deploy IMG=controller:latest")
-	if err := runDir(dir, "make", "deploy", "IMG=controller:latest"); err != nil {
+	step("🚀", "Deploying operator via kustomize")
+
+	// Set the image in kustomization before building
+	managerDir := filepath.Join(dir, "config", "manager")
+	if err := runDir(managerDir, kustomizeBin, "edit", "set", "image", "controller=controller:latest"); err != nil {
+		return fmt.Errorf("kustomize edit set image failed: %w", err)
+	}
+
+	// Build kustomize output and pipe to kubectl apply
+	kustomizeOut, err := runCapture(kustomizeBin, "build", filepath.Join(dir, "config", "default"))
+	if err != nil {
+		return fmt.Errorf("kustomize build failed: %w", err)
+	}
+	if err := runStdin(kustomizeOut, "kubectl", "apply", "-f", "-"); err != nil {
 		return fmt.Errorf("operator deployment failed: %w", err)
 	}
+	success("Operator deployed")
 
 	// ── Wait for operator ───────────────────────────────────────
 	step("⏳", "Waiting for controller-manager rollout")
