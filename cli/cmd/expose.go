@@ -46,12 +46,14 @@ var (
 	exposeProvider string
 	exposePort     int
 	exposeStop     bool
+	exposeService  string
 )
 
 func init() {
 	exposeCmd.Flags().StringVar(&exposeProvider, "provider", "", "Tunnel provider: cloudflared or ngrok (auto-detected if omitted)")
 	exposeCmd.Flags().IntVar(&exposePort, "port", 80, "Local port to expose (default: 80, the ingress controller)")
 	exposeCmd.Flags().BoolVar(&exposeStop, "stop", false, "Stop a running tunnel")
+	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Ingress name to route tunnel traffic to (default: first ingress found)")
 	rootCmd.AddCommand(exposeCmd)
 }
 
@@ -191,6 +193,7 @@ func runCloudflaredTunnel() error {
 
 	// Success — save PID so we can stop it later, then let it run.
 	saveTunnelInfo(publicURL, "cloudflared", tunnelCmd.Process.Pid)
+	patchIngressesForTunnel(publicURL)
 	printTunnelRunning(publicURL, tunnelCmd.Process.Pid)
 
 	// Release the child — we don't wait on it; it runs in the background.
@@ -241,6 +244,7 @@ func runNgrokTunnel() error {
 	}
 
 	saveTunnelInfo(publicURL, "ngrok", tunnelCmd.Process.Pid)
+	patchIngressesForTunnel(publicURL)
 	printTunnelRunning(publicURL, tunnelCmd.Process.Pid)
 
 	// Release the child — runs in background.
@@ -325,11 +329,6 @@ func saveTunnelConfigMap(publicURL string) {
 	if u, err := url.Parse(publicURL); err == nil && u.Host != "" {
 		hostname = u.Host
 	}
-	_, _ = runSilent("kubectl", "create", "configmap", "kindling-tunnel",
-		"--from-literal=url="+publicURL,
-		"--from-literal=hostname="+hostname,
-		"--dry-run=client", "-o", "yaml",
-	)
 	// Pipe through apply so it's idempotent (create or update).
 	yaml, err := runSilent("kubectl", "create", "configmap", "kindling-tunnel",
 		"--from-literal=url="+publicURL,
@@ -412,11 +411,131 @@ func stopTunnel() error {
 	return nil
 }
 
-// cleanupTunnel removes the local tunnel.yaml and the in-cluster ConfigMap.
+// cleanupTunnel restores ingress hosts, removes tunnel.yaml, and deletes the ConfigMap.
 func cleanupTunnel() {
+	restoreIngresses()
 	cwd, _ := os.Getwd()
 	_ = os.Remove(filepath.Join(cwd, ".kindling", "tunnel.yaml"))
 	_, _ = runSilent("kubectl", "delete", "configmap", "kindling-tunnel", "--ignore-not-found")
+}
+
+// ── Ingress patching ──────────────────────────────────────────
+
+const originalHostAnnotation = "kindling.dev/original-host"
+
+// patchIngressesForTunnel replaces the host on every Ingress in the default
+// namespace with the tunnel hostname, saving the original host as an annotation
+// so it can be restored later.
+func patchIngressesForTunnel(publicURL string) {
+	hostname := publicURL
+	if u, err := url.Parse(publicURL); err == nil && u.Host != "" {
+		hostname = u.Host
+	}
+
+	names, err := getIngressNames()
+	if err != nil || len(names) == 0 {
+		return
+	}
+
+	// If --service was specified, only patch that one.
+	if exposeService != "" {
+		found := false
+		for _, n := range names {
+			if n == exposeService {
+				found = true
+				break
+			}
+		}
+		if found {
+			names = []string{exposeService}
+		} else {
+			return
+		}
+	}
+
+	patched := 0
+	for _, name := range names {
+		// Read current host
+		currentHost, err := runSilent("kubectl", "get", "ingress", name,
+			"-o", "jsonpath={.spec.rules[0].host}")
+		if err != nil || strings.TrimSpace(currentHost) == "" {
+			continue
+		}
+		currentHost = strings.TrimSpace(currentHost)
+
+		// Skip if already set to tunnel host
+		if currentHost == hostname {
+			continue
+		}
+
+		// Save original host as annotation, then patch the rule
+		patch := fmt.Sprintf(
+			`[{"op":"add","path":"/metadata/annotations/%s","value":"%s"},{"op":"replace","path":"/spec/rules/0/host","value":"%s"}]`,
+			strings.ReplaceAll(originalHostAnnotation, "/", "~1"),
+			currentHost,
+			hostname,
+		)
+		if _, err := runSilent("kubectl", "patch", "ingress", name,
+			"--type=json", "-p="+patch); err == nil {
+			step("🔀", fmt.Sprintf("Routing tunnel → ingress/%s", name))
+			patched++
+			// Only one ingress can own a given host+path in nginx,
+			// so stop after the first successful patch.
+			break
+		}
+	}
+}
+
+// restoreIngresses reverts any ingresses that were patched by patchIngressesForTunnel,
+// restoring the original host from the saved annotation.
+func restoreIngresses() {
+	names, err := getIngressNames()
+	if err != nil || len(names) == 0 {
+		return
+	}
+
+	restored := 0
+	for _, name := range names {
+		originalHost, err := runSilent("kubectl", "get", "ingress", name,
+			"-o", `go-template={{index .metadata.annotations "kindling.dev/original-host"}}`,
+		)
+		if err != nil {
+			continue
+		}
+		originalHost = strings.TrimSpace(originalHost)
+		if originalHost == "" || strings.Contains(originalHost, "no value") {
+			continue
+		}
+
+		// Restore original host and remove the annotation
+		patch := fmt.Sprintf(
+			`[{"op":"replace","path":"/spec/rules/0/host","value":"%s"},{"op":"remove","path":"/metadata/annotations/%s"}]`,
+			originalHost,
+			strings.ReplaceAll(originalHostAnnotation, "/", "~1"),
+		)
+		if _, err := runSilent("kubectl", "patch", "ingress", name,
+			"--type=json", "-p="+patch); err == nil {
+			restored++
+		}
+	}
+
+	if restored > 0 {
+		step("🔀", fmt.Sprintf("Restored %d ingress(es) to original hosts", restored))
+	}
+}
+
+// getIngressNames returns the names of all Ingresses in the default namespace.
+func getIngressNames() ([]string, error) {
+	out, err := runSilent("kubectl", "get", "ingress",
+		"-o", "jsonpath={.items[*].metadata.name}")
+	if err != nil {
+		return nil, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Fields(out), nil
 }
 
 // ensureTunnelGitignored makes sure .kindling/ is in .gitignore.
