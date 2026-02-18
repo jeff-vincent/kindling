@@ -143,12 +143,20 @@ endpoints, then writes `.github/workflows/dev-deploy.yml` with correct build
 steps, deploy steps, timeouts, and inter-service wiring. Supports OpenAI
 (default) and Anthropic providers.
 
+The scanner also detects:
+- **Helm charts and Kustomize overlays** — renders them for AI context
+- **External credentials** — suggests `kindling secrets set` for each detected API key, token, or DSN
+- **OAuth/OIDC patterns** — flags Auth0, Okta, Firebase Auth, etc. and suggests `kindling expose`
+
 ```bash
 # Use Anthropic instead
 kindling generate -k sk-ant-... -r . --provider anthropic
 
 # Preview without writing a file
 kindling generate -k sk-... -r . --dry-run
+
+# Wire every service with ingress (not just frontends)
+kindling generate -k sk-... -r . --ingress-all
 ```
 
 ### Option B: Write the workflow manually
@@ -191,6 +199,48 @@ jobs:
               version: "16"
             - type: redis
 ```
+
+---
+
+## Step 5b — Set external credentials (if detected)
+
+If `kindling generate` detected external credentials (API keys, tokens, DSNs),
+set them before pushing:
+
+```bash
+# The generate output will list detected credentials like:
+#   🔑 Detected 2 external credential(s): STRIPE_KEY, OPENAI_API_KEY
+#   💡 Run: kindling secrets set <NAME> <VALUE>
+
+kindling secrets set STRIPE_KEY sk_live_abc123
+kindling secrets set OPENAI_API_KEY sk-...
+```
+
+These are stored as K8s Secrets in the cluster. The generated workflow
+references them via `secretKeyRef` — no hardcoded values in YAML.
+
+List your secrets at any time:
+
+```bash
+kindling secrets list
+```
+
+---
+
+## Step 5c — Set up a tunnel for OAuth (if needed)
+
+If your app uses OAuth/OIDC (Auth0, Okta, Firebase Auth, etc.), you need a
+public HTTPS URL for callbacks. The generate output will flag this:
+
+```bash
+#   🔐 Detected 3 OAuth/OIDC indicator(s) in source code
+#   💡 Run kindling expose to create a public HTTPS tunnel
+
+kindling expose
+```
+
+This starts a tunnel (cloudflared or ngrok) and prints the public URL.
+Set it as a secret and configure your OAuth provider’s callback URL.
 
 ---
 
@@ -287,6 +337,10 @@ kindling destroy -y
 
 ## Next steps
 
+- [Secrets Management](secrets.md) — managing API keys, tokens, and
+  credentials across cluster rebuilds
+- [OAuth & Tunnels](oauth-tunnels.md) — setting up public HTTPS for
+  OAuth callbacks
 - [Dependency Reference](dependencies.md) — all 15 dependency types with
   code examples
 - [CRD Reference](crd-reference.md) — full spec for DevStagingEnvironment

@@ -157,6 +157,16 @@ kindling generate [flags]
 | `--model` | | auto | Model name (default: `gpt-4o` for openai, `claude-sonnet-4-20250514` for anthropic) |
 | `--output` | `-o` | `<repo>/.github/workflows/dev-deploy.yml` | Output path for the workflow file |
 | `--dry-run` | | `false` | Print the generated workflow to stdout instead of writing a file |
+| `--ingress-all` | | `false` | Wire every service with an ingress route, not just detected frontends |
+| `--no-helm` | | `false` | Skip Helm/Kustomize rendering; use raw source inference only |
+
+**Smart scanning features:**
+
+- **Helm charts** — Detects `Chart.yaml`, runs `helm template` to render manifests, passes them to the AI as authoritative context. Falls back gracefully if `helm` is not installed.
+- **Kustomize overlays** — Detects `kustomization.yaml`, runs `kustomize build` for rendered context. Falls back gracefully if `kustomize` is not installed.
+- **Ingress heuristics** — Only user-facing services (frontends, SSR, gateways) get ingress routes by default. Use `--ingress-all` to override.
+- **External credential detection** — Scans for `*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*_DSN`, etc. and suggests `kindling secrets set` for each.
+- **OAuth/OIDC detection** — Flags Auth0, Okta, Firebase Auth, NextAuth, Passport.js patterns and suggests `kindling expose`.
 
 **Examples:**
 
@@ -172,6 +182,12 @@ kindling generate -k sk-... -r . --dry-run
 
 # Custom output path
 kindling generate -k sk-... -r . -o ./my-workflow.yml
+
+# Wire every service with ingress (not just frontends)
+kindling generate -k sk-... -r . --ingress-all
+
+# Skip Helm/Kustomize rendering
+kindling generate -k sk-... -r . --no-helm
 ```
 
 ---
@@ -278,6 +294,100 @@ kindling logs --all
 
 ---
 
+### `kindling secrets`
+
+Manage external credentials (API keys, tokens, DSNs) as Kubernetes
+Secrets in the Kind cluster.
+
+```
+kindling secrets <subcommand> [flags]
+```
+
+**Subcommands:**
+
+| Subcommand | Description |
+|---|---|
+| `set <name> <value>` | Create or update a K8s Secret and back it up locally |
+| `list` | List all kindling-managed secrets (names only) |
+| `delete <name>` | Remove from cluster and local backup |
+| `restore` | Re-create all secrets from `.kindling/secrets.yaml` after a cluster rebuild |
+
+**How it works:**
+
+- Each secret is stored as a K8s Secret named `kindling-secret-<lowercase-name>` with the label `app.kubernetes.io/managed-by=kindling`
+- A local backup is maintained at `.kindling/secrets.yaml` (base64-encoded values, auto-gitignored)
+- `kindling secrets restore` reads the backup and re-creates all secrets — run this after `kindling init` to restore credentials from a previous cluster
+
+**Examples:**
+
+```bash
+# Store a Stripe API key
+kindling secrets set STRIPE_KEY sk_live_abc123
+
+# Store a database connection string
+kindling secrets set DATABASE_URL postgres://user:pass@host/db
+
+# List all managed secrets
+kindling secrets list
+
+# Remove a secret
+kindling secrets delete STRIPE_KEY
+
+# After cluster rebuild, restore all secrets
+kindling init
+kindling secrets restore
+```
+
+---
+
+### `kindling expose`
+
+Create a public HTTPS tunnel to the Kind cluster’s ingress controller
+for OAuth/OIDC callbacks.
+
+```
+kindling expose [flags]
+```
+
+**What it does:**
+1. Detects an available tunnel provider (cloudflared or ngrok)
+2. Verifies the Kind cluster is running
+3. Starts a tunnel from a public HTTPS URL to `localhost:<port>`
+4. Prints the public URL and saves it to `.kindling/tunnel.yaml`
+5. Waits for Ctrl+C, then gracefully stops the tunnel
+
+**Supported providers:**
+
+| Provider | Account required | Install |
+|---|---|---|
+| cloudflared | No (quick tunnels are free) | [Download](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) |
+| ngrok | Yes (free tier available) | [Download](https://ngrok.com/download) |
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--provider` | auto-detect | Tunnel provider: `cloudflared` or `ngrok` |
+| `--port` | `80` | Local port to expose (default: ingress controller) |
+
+**Examples:**
+
+```bash
+# Auto-detect provider, expose port 80
+kindling expose
+
+# Use cloudflared explicitly
+kindling expose --provider cloudflared
+
+# Use ngrok
+kindling expose --provider ngrok
+
+# Expose a different port
+kindling expose --port 443
+```
+
+---
+
 ### `kindling destroy`
 
 Delete the Kind cluster and all resources.
@@ -340,24 +450,34 @@ go build -ldflags "-X github.com/jeffvincent/kindling/cli/cmd.Version=v1.0.0" -o
 # 1. Bootstrap everything
 kindling init
 
-# 2. Connect a GitHub repo
+# 2. Restore secrets from a previous cluster (if any)
+kindling secrets restore
+
+# 3. Connect a GitHub repo
 kindling quickstart -u alice -r acme/myapp -t ghp_xxxxx
 
-# 3. Generate a workflow for your app
+# 4. Generate a workflow for your app
 kindling generate -k sk-... -r /path/to/myapp
 
-# 4. Push code → CI builds + deploys automatically
+# 5. Set any external credentials that were detected
+kindling secrets set STRIPE_KEY sk_live_...
+kindling secrets set OPENAI_API_KEY sk-...
+
+# 6. If OAuth is needed, start a tunnel
+kindling expose
+
+# 7. Push code → CI builds + deploys automatically
 git push origin main
 
-# 5. Check status
+# 8. Check status
 kindling status
 
-# 6. View controller logs
+# 9. View controller logs
 kindling logs
 
-# 7. Manual deploy (without CI)
+# 10. Manual deploy (without CI)
 kindling deploy -f dev-environment.yaml
 
-# 8. Tear down when done
+# 11. Tear down when done
 kindling destroy -y
 ```

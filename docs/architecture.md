@@ -269,6 +269,90 @@ See [dependencies.md](dependencies.md) for the full reference.
 
 ---
 
+## AI workflow generation pipeline
+
+`kindling generate` uses a multi-stage pipeline to produce accurate
+workflow files:
+
+```
+Repo scan → Helm/Kustomize render → Credential detection → OAuth detection → Prompt assembly → AI call → YAML output
+```
+
+### Stage 1: Repo scan
+Walks the directory tree collecting Dockerfiles, dependency manifests
+(go.mod, package.json, requirements.txt, etc.), docker-compose.yml, and
+source file entry points. Prioritizes files by relevance (main.go,
+app.py, index.ts, etc.).
+
+### Stage 2: Helm & Kustomize rendering
+If `Chart.yaml` or `kustomization.yaml` is found, runs `helm template`
+or `kustomize build` to produce rendered manifests. These are passed to
+the AI as authoritative context for ports, env vars, and service names.
+Gracefully falls back if the tools aren’t installed.
+
+### Stage 3: External credential detection
+Scans all collected content for env var patterns matching external
+credentials (`*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*_DSN`, etc.). Also
+checks `.env` files. Detected credentials are included in the AI prompt
+so the generated workflow wires them as `secretKeyRef`.
+
+### Stage 4: OAuth / OIDC detection
+Scans for 40+ patterns indicating OAuth usage (Auth0, Okta, Firebase
+Auth, NextAuth, Passport.js, OIDC discovery endpoints, redirect URIs,
+callback routes). If detected, the CLI suggests `kindling expose` and
+the AI adds tunnel-related comments to the workflow.
+
+### Stage 5: Prompt assembly
+Builds a system prompt with kindling conventions and a user prompt
+containing all collected context. The system prompt covers 9 languages,
+15 dependency types, build timeout guidance, and Dockerfile pitfalls.
+
+### Stage 6: AI call & output
+Calls OpenAI or Anthropic, cleans the response (strips markdown fences),
+and writes the YAML to `.github/workflows/dev-deploy.yml`.
+
+---
+
+## Secrets management
+
+`kindling secrets` stores external credentials as Kubernetes Secrets
+with the label `app.kubernetes.io/managed-by=kindling`.
+
+```
+kindling secrets set STRIPE_KEY sk_live_...
+       │
+       ├──→ kubectl create secret generic kindling-secret-stripe-key
+       │       --from-literal=value=sk_live_...
+       │       -l app.kubernetes.io/managed-by=kindling
+       │
+       └──→ .kindling/secrets.yaml  (base64-encoded local backup)
+```
+
+**Naming convention:** `STRIPE_KEY` → K8s Secret `kindling-secret-stripe-key`
+
+The local backup at `.kindling/secrets.yaml` survives cluster rebuilds.
+After `kindling destroy` + `kindling init`, run `kindling secrets restore`
+to re-create all secrets from the backup.
+
+---
+
+## Public HTTPS tunnels
+
+`kindling expose` creates a secure tunnel for OAuth callbacks:
+
+```
+Internet → Tunnel Provider (TLS) → localhost:80 → ingress-nginx → App Pod
+```
+
+Supported providers:
+- **cloudflared** — Cloudflare Tunnel quick tunnels (free, no account)
+- **ngrok** — requires free account + auth token
+
+The tunnel URL is saved to `.kindling/tunnel.yaml` and cleaned up on
+Ctrl+C. The `.kindling/` directory is auto-gitignored.
+
+---
+
 ## Owner references and garbage collection
 
 Every resource the operator creates (Deployments, Services, Secrets,
@@ -301,6 +385,9 @@ kindling/
 │   │   ├── root.go
 │   │   ├── init.go
 │   │   ├── quickstart.go
+│   │   ├── generate.go         # AI workflow generation + Helm/Kustomize/credential/OAuth scanning
+│   │   ├── secrets.go          # Secret management (set/list/delete/restore)
+│   │   ├── expose.go           # Public HTTPS tunnel (cloudflared/ngrok)
 │   │   ├── deploy.go
 │   │   ├── status.go
 │   │   ├── logs.go

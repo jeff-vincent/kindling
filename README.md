@@ -383,6 +383,13 @@ kindling quickstart -u <github-user> -r <owner/repo> -t <pat>
 # AI-generate a GitHub Actions workflow for your repo
 kindling generate -k <api-key> -r /path/to/my-app
 
+# Manage external secrets (API keys, tokens, DSNs)
+kindling secrets set STRIPE_KEY sk_live_...
+kindling secrets list
+
+# Expose cluster publicly for OAuth callbacks
+kindling expose
+
 # Deploy a dev staging environment
 kindling deploy -f examples/sample-app/dev-environment.yaml
 
@@ -409,6 +416,13 @@ kindling destroy
 | `kindling init --skip-cluster` | Skip cluster creation, use existing cluster |
 | `kindling quickstart` | Create GitHub PAT secret + runner pool CR |
 | `kindling generate -k <key> -r <path>` | AI-generate a dev-deploy.yml workflow for any repo |
+| `kindling generate --ingress-all` | Wire every service with an ingress route (not just frontends) |
+| `kindling generate --no-helm` | Skip Helm/Kustomize rendering, use raw source inference |
+| `kindling secrets set <name> <value>` | Store an external credential as a K8s Secret |
+| `kindling secrets list` | List managed secrets (names only) |
+| `kindling secrets delete <name>` | Remove a secret from the cluster and local backup |
+| `kindling secrets restore` | Re-create K8s Secrets from the local `.kindling/secrets.yaml` backup |
+| `kindling expose` | Create a public HTTPS tunnel (cloudflared/ngrok) for OAuth callbacks |
 | `kindling deploy -f <file>` | Apply a DevStagingEnvironment from a YAML file |
 | `kindling status` | Dashboard view of cluster, operator, runners, environments, and ingress routes |
 | `kindling logs` | Tail the kindling controller logs (`-f` for follow, `--all` for all containers) |
@@ -495,6 +509,98 @@ Go API + React dashboard connected to Postgres, Redis, Elasticsearch, Kafka, and
 → [examples/platform-api/](examples/platform-api/) · [README](examples/platform-api/README.md)
 
 All three examples use the **reusable kindling GitHub Actions** (`kindling-build` + `kindling-deploy`) — no raw signal-file scripting required.
+
+---
+
+## Secrets Management
+
+`kindling secrets` manages external credentials (API keys, tokens, DSNs) as Kubernetes Secrets in the Kind cluster, with an automatic local backup for cluster rebuilds.
+
+```bash
+# Store a credential
+kindling secrets set STRIPE_KEY sk_live_abc123
+
+# List managed secrets (names only — values are never printed)
+kindling secrets list
+
+# Remove a secret
+kindling secrets delete STRIPE_KEY
+
+# After 'kindling destroy' + 'kindling init', restore all secrets
+kindling secrets restore
+```
+
+Secrets are stored as K8s Secrets labeled `app.kubernetes.io/managed-by=kindling` and backed up to `.kindling/secrets.yaml` (base64-encoded, auto-gitignored). The AI-generated workflow references them via `secretKeyRef`:
+
+```yaml
+env:
+  # Requires: kindling secrets set STRIPE_KEY <value>
+  STRIPE_KEY:
+    secretKeyRef:
+      name: kindling-secret-stripe-key
+      key: value
+```
+
+→ [docs/secrets.md](docs/secrets.md)
+
+---
+
+## Smart Generate Features
+
+`kindling generate` goes beyond basic Dockerfile detection:
+
+### Helm & Kustomize awareness
+
+When a `Chart.yaml` or `kustomization.yaml` is found, kindling automatically runs `helm template` or `kustomize build`, then passes the rendered manifests to the AI as authoritative context. This means the generated workflow accurately reflects ports, env vars, and dependencies defined in your Helm values or Kustomize overlays — not just what's in source code.
+
+Use `--no-helm` to skip rendering and fall back to source-code-only inference. If `helm` or `kustomize` aren't installed, kindling gracefully falls back to using the raw chart/overlay files as context.
+
+### Ingress heuristics
+
+The AI uses language-aware heuristics to decide which services should get public ingress routes:
+- **Frontends** — React, Next.js, Vue, Angular, static file servers
+- **SSR frameworks** — Rails views, Django templates, PHP apps
+- **API gateways** — services named `gateway`, `api-gateway`, `bff`
+
+Backend services (workers, internal APIs) are deployed without ingress by default. Use `--ingress-all` to override and wire every service with a route.
+
+### External credential detection
+
+During scanning, kindling detects env var references that look like external credentials (`*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*_DSN`, etc.) and:
+1. Lists them in the CLI output
+2. Suggests `kindling secrets set <name> <value>` for each
+3. Instructs the AI to wire them as `secretKeyRef` in the generated workflow
+
+### OAuth / OIDC detection
+
+If Auth0, Okta, Firebase Auth, NextAuth, Passport.js, or other OAuth/OIDC patterns are found in source code, kindling flags them during scanning and suggests running `kindling expose` to create a public HTTPS tunnel for OAuth callbacks.
+
+---
+
+## Public HTTPS Tunnels (OAuth)
+
+`kindling expose` creates a secure tunnel from a public HTTPS URL to the Kind cluster's ingress, so external identity providers can reach local services for OAuth callbacks.
+
+```bash
+# Auto-detect provider (prefers cloudflared)
+kindling expose
+
+# Explicit provider
+kindling expose --provider cloudflared
+kindling expose --provider ngrok
+```
+
+Supported providers:
+- **cloudflared** — Cloudflare Tunnel (free, no account required for quick tunnels)
+- **ngrok** — requires a free account and auth token
+
+The public URL is printed to stdout and saved to `.kindling/tunnel.yaml`. After the tunnel is running:
+
+1. Set the callback URL in your OAuth provider (e.g. `https://<tunnel-url>/callback`)
+2. Store the public URL as a secret: `kindling secrets set PUBLIC_URL https://<tunnel-url>`
+3. Push code — the generated workflow wires the secret into your app
+
+→ [docs/oauth-tunnels.md](docs/oauth-tunnels.md)
 
 ---
 
@@ -596,7 +702,10 @@ flowchart TB
 ├── cli/                                 # kindling CLI tool (cobra)
 │   ├── main.go                          #   CLI entrypoint
 │   └── cmd/                             #   Commands: init, quickstart, deploy,
-│       ├── init.go                      #     status, logs, destroy, version
+│       ├── init.go                      #     generate, secrets, expose, status,
+│       ├── generate.go                  #     logs, destroy, version
+│       ├── secrets.go
+│       ├── expose.go
 │       └── ...
 ├── cmd/main.go                          # Operator entrypoint
 ├── examples/
@@ -659,6 +768,13 @@ kind delete cluster --name dev
 - [x] AI-powered workflow generation — `kindling generate` (OpenAI + Anthropic, 9 languages)
 - [x] Kaniko layer caching — `registry:5000/cache` for fast rebuilds
 - [x] Reusable GitHub Actions — `kindling-build` + `kindling-deploy`
+- [x] Helm & Kustomize awareness — auto-renders charts/overlays, passes manifests to AI for context
+- [x] Smart ingress heuristics — frontends, SSR frameworks, and API gateways auto-detected
+- [x] `--ingress-all` flag — wire every service with an ingress route
+- [x] `kindling secrets` — manage external credentials as K8s Secrets with local backup
+- [x] External credential detection — scans for API keys, tokens, DSNs during generate
+- [x] `kindling expose` — public HTTPS tunnels (cloudflared/ngrok) for OAuth/OIDC callbacks
+- [x] OAuth/OIDC detection — flags Auth0, Okta, Firebase, NextAuth patterns and suggests `kindling expose`
 - [ ] Automatic TTL-based cleanup of stale `DevStagingEnvironment` CRs
 - [ ] Live status integration — `GithubActionRunnerPool.status.activeJob`
 - [ ] Webhook receiver for GitHub push events as an alternative to long-polling
