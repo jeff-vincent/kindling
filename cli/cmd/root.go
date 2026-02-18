@@ -30,6 +30,7 @@ Common workflow:
   kindling expose                         # public HTTPS tunnel for OAuth
   kindling status                         # view everything at a glance
   kindling logs                           # tail the controller
+  kindling reset                          # remove runner pool, keep cluster
   kindling destroy                        # tear it all down`,
 }
 
