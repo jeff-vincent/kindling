@@ -45,15 +45,15 @@ heuristics miss something.
 
 ---
 
-## CLI: kindling secrets subcommand
+## ~~CLI: kindling secrets subcommand~~ ✅
 
-New `kindling secrets` subcommand with set/list/delete operations:
+Implemented `kindling secrets` with four subcommands:
 
-- `kindling secrets set <name> <value>` — creates a K8s Secret in the Kind
-  cluster and optionally persists it to a local encrypted store (age/sops) so
-  secrets survive cluster rebuilds
-- `kindling secrets list` — shows configured secret names (not values)
-- `kindling secrets delete <name>` — removes from both cluster and local store
+- `kindling secrets set <NAME> <VALUE>` — creates K8s Secret + local backup
+- `kindling secrets list` — shows managed secret names and keys
+- `kindling secrets delete <NAME>` — removes from cluster + local backup
+- `kindling secrets restore` — re-creates K8s Secrets from local backup after
+  cluster rebuild
 
 ---
 
@@ -73,14 +73,11 @@ For each detected external secret:
 
 ---
 
-## Config: .kindling/secrets.yaml
+## ~~Config: .kindling/secrets.yaml~~ ✅
 
-Introduce a `.kindling/secrets.yaml` config file (gitignored by `kindling init`).
-Maps logical secret names to K8s Secret object references (name + key). Survives
-cluster rebuilds — `kindling init` or `kindling secrets restore` reads this file
-and re-creates K8s Secrets from the local encrypted store. The generated workflow
-references secrets via these stable names so the YAML doesn't need to change when
-credentials rotate.
+Implemented as part of `kindling secrets`. File is stored at
+`.kindling/secrets.yaml` (auto-gitignored). Values are base64-encoded.
+`kindling secrets restore` reads this file and re-creates K8s Secrets.
 
 ---
 
