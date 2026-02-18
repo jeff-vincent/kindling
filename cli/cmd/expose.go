@@ -427,6 +427,10 @@ const originalHostAnnotation = "kindling.dev/original-host"
 // namespace with the tunnel hostname, saving the original host as an annotation
 // so it can be restored later.
 func patchIngressesForTunnel(publicURL string) {
+	// Always restore any orphaned ingresses first — self-heals if a previous
+	// tunnel died without cleanup (e.g. machine sleep, force-kill).
+	restoreIngresses()
+
 	hostname := publicURL
 	if u, err := url.Parse(publicURL); err == nil && u.Host != "" {
 		hostname = u.Host
