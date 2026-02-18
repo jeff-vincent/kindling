@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,7 +24,7 @@ var exposeCmd = &cobra.Command{
 ingress controller, enabling external OAuth/OIDC providers (Auth0, Okta,
 Firebase Auth, etc.) to call back into local services.
 
-The tunnel provider handles TLS termination automatically.
+The tunnel runs in the background — you get your terminal back immediately.
 
 Supported providers:
   cloudflared  — Cloudflare Tunnel (free, no account required for quick tunnels)
@@ -30,29 +33,47 @@ Supported providers:
 Examples:
   kindling expose                          # auto-detect provider, expose port 80
   kindling expose --provider cloudflared   # use cloudflared explicitly
-  kindling expose --provider ngrok         # use ngrok explicitly
   kindling expose --port 443               # expose a different port
+  kindling expose --stop                   # stop a running tunnel
 
-The public URL is printed to stdout and saved to .kindling/tunnel.yaml so that
-other commands (kindling generate) can reference it.
-
-Press Ctrl+C to stop the tunnel.`,
+The public URL is saved to .kindling/tunnel.yaml so that other commands
+(kindling generate) can reference it.`,
 	RunE: runExpose,
 }
 
 var (
 	exposeProvider string
 	exposePort     int
+	exposeStop     bool
 )
 
 func init() {
 	exposeCmd.Flags().StringVar(&exposeProvider, "provider", "", "Tunnel provider: cloudflared or ngrok (auto-detected if omitted)")
 	exposeCmd.Flags().IntVar(&exposePort, "port", 80, "Local port to expose (default: 80, the ingress controller)")
+	exposeCmd.Flags().BoolVar(&exposeStop, "stop", false, "Stop a running tunnel")
 	rootCmd.AddCommand(exposeCmd)
 }
 
 func runExpose(cmd *cobra.Command, args []string) error {
+	// ── Stop mode ───────────────────────────────────────────────
+	if exposeStop {
+		return stopTunnel()
+	}
+
 	header("Public HTTPS tunnel")
+
+	// ── Check for already-running tunnel ────────────────────────
+	if info, _ := readTunnelInfo(); info != nil && info.PID > 0 {
+		if processAlive(info.PID) {
+			success(fmt.Sprintf("Tunnel already running → %s%s%s (pid %d)", colorBold, info.URL, colorReset, info.PID))
+			fmt.Println()
+			fmt.Printf("  Stop with: %skindling expose --stop%s\n", colorCyan, colorReset)
+			fmt.Println()
+			return nil
+		}
+		// Stale PID — clean up and start fresh
+		cleanupTunnelFile()
+	}
 
 	// ── Resolve provider ────────────────────────────────────────
 	provider := exposeProvider
@@ -63,18 +84,16 @@ func runExpose(cmd *cobra.Command, args []string) error {
 		fail("No tunnel provider found")
 		fmt.Println()
 		fmt.Println("  Install one of:")
-		fmt.Printf("    cloudflared  → %shttps://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/%s\n", colorCyan, colorReset)
-		fmt.Printf("    ngrok        → %shttps://ngrok.com/download%s\n", colorCyan, colorReset)
+		fmt.Printf("    brew install cloudflare/cloudflare/cloudflared\n")
+		fmt.Printf("    brew install ngrok/ngrok/ngrok\n")
 		fmt.Println()
 		return fmt.Errorf("install cloudflared or ngrok and try again")
 	}
-	step("🔍", fmt.Sprintf("Using provider: %s%s%s", colorBold, provider, colorReset))
 
 	// ── Verify cluster is running ───────────────────────────────
 	if !clusterExists(clusterName) {
 		return fmt.Errorf("Kind cluster %q not found — run 'kindling init' first", clusterName)
 	}
-	step("✅", fmt.Sprintf("Cluster %q is running", clusterName))
 
 	// ── Start tunnel ────────────────────────────────────────────
 	switch provider {
@@ -101,39 +120,52 @@ func detectTunnelProvider() string {
 // ── Cloudflared ─────────────────────────────────────────────────
 
 func runCloudflaredTunnel() error {
-	step("🚇", fmt.Sprintf("Starting cloudflared tunnel → localhost:%d", exposePort))
-	fmt.Println()
-
-	// cloudflared quick tunnels print the URL to stderr in a line like:
-	//   | https://some-random-name.trycloudflare.com |
-	// We capture it from a log file.
-
-	logFile, err := os.CreateTemp("", "kindling-cloudflared-*.log")
-	if err != nil {
-		return fmt.Errorf("cannot create temp log file: %w", err)
-	}
-	defer os.Remove(logFile.Name())
+	step("⏳", "Starting cloudflared tunnel...")
 
 	tunnelCmd := exec.Command("cloudflared", "tunnel",
 		"--url", fmt.Sprintf("http://localhost:%d", exposePort),
-		"--logfile", logFile.Name(),
 	)
-	tunnelCmd.Stdout = os.Stdout
-	tunnelCmd.Stderr = os.Stderr
+
+	// Capture stderr silently for URL parsing — no noise on the terminal.
+	var stderrBuf bytes.Buffer
+	var mu sync.Mutex
+	pr, pw := io.Pipe()
+	tunnelCmd.Stdout = nil
+	tunnelCmd.Stderr = pw
+
+	// Detach from parent process group so it survives CLI exit.
+	tunnelCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Read stderr into buffer in background.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := pr.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				stderrBuf.Write(buf[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 
 	if err := tunnelCmd.Start(); err != nil {
+		pw.Close()
 		return fmt.Errorf("failed to start cloudflared: %w", err)
 	}
 
-	// Wait for the URL to appear in the log
+	// Poll the captured stderr for the tunnel URL.
 	var publicURL string
 	for i := 0; i < 30; i++ {
 		time.Sleep(1 * time.Second)
-		data, _ := os.ReadFile(logFile.Name())
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
+		mu.Lock()
+		data := stderrBuf.String()
+		mu.Unlock()
+		for _, line := range strings.Split(data, "\n") {
 			if strings.Contains(line, ".trycloudflare.com") {
-				// Extract URL
 				for _, word := range strings.Fields(line) {
 					if strings.HasPrefix(word, "https://") && strings.Contains(word, ".trycloudflare.com") {
 						publicURL = strings.TrimRight(word, "|, ")
@@ -148,35 +180,42 @@ func runCloudflaredTunnel() error {
 	}
 
 	if publicURL == "" {
-		// Fallback: tunnel is running but we couldn't parse the URL
-		warn("Tunnel is running but could not detect public URL from logs")
-		fmt.Println("  Check cloudflared output above for the public URL")
-	} else {
-		fmt.Println()
-		success(fmt.Sprintf("Public URL: %s%s%s", colorBold, publicURL, colorReset))
-		saveTunnelInfo(publicURL, "cloudflared")
-		printTunnelUsage(publicURL)
+		// Kill the process if we couldn't get a URL — no point leaving it around.
+		if tunnelCmd.Process != nil {
+			_ = tunnelCmd.Process.Kill()
+		}
+		pw.Close()
+		return fmt.Errorf("could not detect public URL — try running cloudflared manually")
 	}
 
-	// Wait for interrupt
-	waitForInterrupt(tunnelCmd)
+	// Success — save PID so we can stop it later, then let it run.
+	saveTunnelInfo(publicURL, "cloudflared", tunnelCmd.Process.Pid)
+	printTunnelRunning(publicURL, tunnelCmd.Process.Pid)
+
+	// Release the child — we don't wait on it; it runs in the background.
+	go func() {
+		_ = tunnelCmd.Wait()
+		pw.Close()
+	}()
+
 	return nil
 }
 
 // ── Ngrok ───────────────────────────────────────────────────────
 
 func runNgrokTunnel() error {
-	step("🚇", fmt.Sprintf("Starting ngrok tunnel → localhost:%d", exposePort))
-	fmt.Println()
+	step("⏳", "Starting ngrok tunnel...")
 
-	// Start ngrok in background with API
 	tunnelCmd := exec.Command("ngrok", "http",
 		fmt.Sprintf("%d", exposePort),
 		"--log", "stdout",
 		"--log-format", "json",
 	)
-	tunnelCmd.Stdout = os.Stdout
-	tunnelCmd.Stderr = os.Stderr
+	tunnelCmd.Stdout = nil
+	tunnelCmd.Stderr = nil
+
+	// Detach from parent process group so it survives CLI exit.
+	tunnelCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := tunnelCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start ngrok: %w", err)
@@ -194,17 +233,18 @@ func runNgrokTunnel() error {
 	}
 
 	if publicURL == "" {
-		warn("Tunnel is running but could not detect public URL from ngrok API")
-		fmt.Println("  Check ngrok dashboard at http://localhost:4040")
-	} else {
-		fmt.Println()
-		success(fmt.Sprintf("Public URL: %s%s%s", colorBold, publicURL, colorReset))
-		saveTunnelInfo(publicURL, "ngrok")
-		printTunnelUsage(publicURL)
+		if tunnelCmd.Process != nil {
+			_ = tunnelCmd.Process.Kill()
+		}
+		return fmt.Errorf("could not detect public URL — check ngrok dashboard at http://localhost:4040")
 	}
 
-	// Wait for interrupt
-	waitForInterrupt(tunnelCmd)
+	saveTunnelInfo(publicURL, "ngrok", tunnelCmd.Process.Pid)
+	printTunnelRunning(publicURL, tunnelCmd.Process.Pid)
+
+	// Release the child — runs in background.
+	go func() { _ = tunnelCmd.Wait() }()
+
 	return nil
 }
 
@@ -238,8 +278,25 @@ func getNgrokPublicURL() (string, error) {
 
 // ── Shared helpers ──────────────────────────────────────────────
 
-// saveTunnelInfo persists the tunnel URL to .kindling/tunnel.yaml.
-func saveTunnelInfo(publicURL, provider string) {
+// tunnelInfo represents the persisted state of a running tunnel.
+type tunnelInfo struct {
+	Provider string
+	URL      string
+	PID      int
+}
+
+// printTunnelRunning shows the success output after backgrounding.
+func printTunnelRunning(publicURL string, pid int) {
+	fmt.Println()
+	success(fmt.Sprintf("%s%s%s", colorBold, publicURL, colorReset))
+	fmt.Println()
+	fmt.Printf("  Tunnel running in background %s(pid %d)%s\n", colorDim, pid, colorReset)
+	fmt.Printf("  Stop with: %skindling expose --stop%s\n", colorCyan, colorReset)
+	fmt.Println()
+}
+
+// saveTunnelInfo persists the tunnel URL and PID to .kindling/tunnel.yaml.
+func saveTunnelInfo(publicURL, provider string, pid int) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return
@@ -248,13 +305,87 @@ func saveTunnelInfo(publicURL, provider string) {
 	_ = os.MkdirAll(kindlingDir, 0755)
 
 	tunnelFile := filepath.Join(kindlingDir, "tunnel.yaml")
-	content := fmt.Sprintf("# Generated by kindling expose — do not edit\nprovider: %s\nurl: %s\ncreated: %s\n",
-		provider, publicURL, time.Now().Format(time.RFC3339))
+	content := fmt.Sprintf("# Generated by kindling expose — do not edit\nprovider: %s\nurl: %s\npid: %d\ncreated: %s\n",
+		provider, publicURL, pid, time.Now().Format(time.RFC3339))
 
 	_ = os.WriteFile(tunnelFile, []byte(content), 0644)
 
 	// Ensure .kindling/ is gitignored
 	ensureTunnelGitignored(cwd)
+}
+
+// readTunnelInfo loads tunnel state from .kindling/tunnel.yaml.
+func readTunnelInfo() (*tunnelInfo, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(cwd, ".kindling", "tunnel.yaml"))
+	if err != nil {
+		return nil, err
+	}
+
+	info := &tunnelInfo{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "provider:") {
+			info.Provider = strings.TrimSpace(strings.TrimPrefix(line, "provider:"))
+		} else if strings.HasPrefix(line, "url:") {
+			info.URL = strings.TrimSpace(strings.TrimPrefix(line, "url:"))
+		} else if strings.HasPrefix(line, "pid:") {
+			info.PID, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid:")))
+		}
+	}
+	return info, nil
+}
+
+// processAlive checks if a process with the given PID is still running.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// On Unix, signal 0 checks if the process exists.
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// stopTunnel kills a running tunnel and cleans up.
+func stopTunnel() error {
+	info, err := readTunnelInfo()
+	if err != nil || info == nil || info.PID == 0 {
+		fmt.Println("  No tunnel is currently running.")
+		return nil
+	}
+
+	if !processAlive(info.PID) {
+		cleanupTunnelFile()
+		fmt.Println("  Tunnel process already exited — cleaned up.")
+		return nil
+	}
+
+	step("🛑", fmt.Sprintf("Stopping %s tunnel (pid %d)...", info.Provider, info.PID))
+
+	proc, err := os.FindProcess(info.PID)
+	if err != nil {
+		return fmt.Errorf("could not find process %d: %w", info.PID, err)
+	}
+
+	_ = proc.Signal(syscall.SIGTERM)
+	// Give it a moment, then force-kill.
+	time.Sleep(2 * time.Second)
+	if processAlive(info.PID) {
+		_ = proc.Kill()
+	}
+
+	cleanupTunnelFile()
+	success("Tunnel stopped")
+	return nil
+}
+
+// cleanupTunnelFile removes .kindling/tunnel.yaml.
+func cleanupTunnelFile() {
+	cwd, _ := os.Getwd()
+	_ = os.Remove(filepath.Join(cwd, ".kindling", "tunnel.yaml"))
 }
 
 // ensureTunnelGitignored makes sure .kindling/ is in .gitignore.
@@ -283,52 +414,4 @@ func ensureTunnelGitignored(repoRoot string) {
 		_, _ = f.WriteString("\n")
 	}
 	_, _ = f.WriteString(".kindling/\n")
-}
-
-// printTunnelUsage shows next steps after the tunnel is established.
-func printTunnelUsage(publicURL string) {
-	fmt.Println()
-	step("📋", "Next steps:")
-	fmt.Println()
-	fmt.Printf("  1. Set the callback URL in your OAuth provider to:\n")
-	fmt.Printf("     %s%s/callback%s  (or your app's callback path)\n", colorCyan, publicURL, colorReset)
-	fmt.Println()
-	fmt.Printf("  2. Set the public URL as a secret:\n")
-	fmt.Printf("     %skindling secrets set PUBLIC_URL %s%s\n", colorCyan, publicURL, colorReset)
-	fmt.Println()
-	fmt.Printf("  3. Use the URL in your deploy env vars:\n")
-	fmt.Printf("     The generated workflow can reference it via secretKeyRef\n")
-	fmt.Println()
-	fmt.Printf("  Tunnel dashboard: %shttp://localhost:4040%s (ngrok only)\n", colorDim, colorReset)
-	fmt.Printf("  Stop tunnel:      %sCtrl+C%s\n", colorDim, colorReset)
-	fmt.Println()
-}
-
-// waitForInterrupt blocks until SIGINT/SIGTERM, then kills the child process.
-func waitForInterrupt(cmd *exec.Cmd) {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	<-sigCh
-	fmt.Println()
-	step("🛑", "Stopping tunnel...")
-
-	if cmd.Process != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		// Give it a moment to clean up
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-		}
-	}
-
-	// Clean up tunnel file
-	cwd, _ := os.Getwd()
-	tunnelFile := filepath.Join(cwd, ".kindling", "tunnel.yaml")
-	_ = os.Remove(tunnelFile)
-
-	success("Tunnel stopped")
 }
