@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,7 +73,7 @@ func runExpose(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		// Stale PID — clean up and start fresh
-		cleanupTunnelFile()
+		cleanupTunnel()
 	}
 
 	// ── Resolve provider ────────────────────────────────────────
@@ -295,7 +296,8 @@ func printTunnelRunning(publicURL string, pid int) {
 	fmt.Println()
 }
 
-// saveTunnelInfo persists the tunnel URL and PID to .kindling/tunnel.yaml.
+// saveTunnelInfo persists the tunnel URL and PID to .kindling/tunnel.yaml
+// and creates a ConfigMap in the cluster so the deploy action can discover it.
 func saveTunnelInfo(publicURL, provider string, pid int) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -312,6 +314,34 @@ func saveTunnelInfo(publicURL, provider string, pid int) {
 
 	// Ensure .kindling/ is gitignored
 	ensureTunnelGitignored(cwd)
+
+	// Create/update ConfigMap in the cluster so the deploy action can auto-detect the tunnel.
+	saveTunnelConfigMap(publicURL)
+}
+
+// saveTunnelConfigMap creates a ConfigMap with the tunnel URL + hostname.
+func saveTunnelConfigMap(publicURL string) {
+	hostname := publicURL
+	if u, err := url.Parse(publicURL); err == nil && u.Host != "" {
+		hostname = u.Host
+	}
+	_, _ = runSilent("kubectl", "create", "configmap", "kindling-tunnel",
+		"--from-literal=url="+publicURL,
+		"--from-literal=hostname="+hostname,
+		"--dry-run=client", "-o", "yaml",
+	)
+	// Pipe through apply so it's idempotent (create or update).
+	yaml, err := runSilent("kubectl", "create", "configmap", "kindling-tunnel",
+		"--from-literal=url="+publicURL,
+		"--from-literal=hostname="+hostname,
+		"--dry-run=client", "-o", "yaml",
+	)
+	if err != nil {
+		return
+	}
+	applyCmd := exec.Command("kubectl", "apply", "-f", "-")
+	applyCmd.Stdin = strings.NewReader(yaml)
+	_ = applyCmd.Run()
 }
 
 // readTunnelInfo loads tunnel state from .kindling/tunnel.yaml.
@@ -358,7 +388,7 @@ func stopTunnel() error {
 	}
 
 	if !processAlive(info.PID) {
-		cleanupTunnelFile()
+		cleanupTunnel()
 		fmt.Println("  Tunnel process already exited — cleaned up.")
 		return nil
 	}
@@ -377,15 +407,16 @@ func stopTunnel() error {
 		_ = proc.Kill()
 	}
 
-	cleanupTunnelFile()
+	cleanupTunnel()
 	success("Tunnel stopped")
 	return nil
 }
 
-// cleanupTunnelFile removes .kindling/tunnel.yaml.
-func cleanupTunnelFile() {
+// cleanupTunnel removes the local tunnel.yaml and the in-cluster ConfigMap.
+func cleanupTunnel() {
 	cwd, _ := os.Getwd()
 	_ = os.Remove(filepath.Join(cwd, ".kindling", "tunnel.yaml"))
+	_, _ = runSilent("kubectl", "delete", "configmap", "kindling-tunnel", "--ignore-not-found")
 }
 
 // ensureTunnelGitignored makes sure .kindling/ is in .gitignore.

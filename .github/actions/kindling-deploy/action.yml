@@ -58,6 +58,10 @@ inputs:
     description: "Rollout wait timeout"
     required: false
     default: "180s"
+  tunnel:
+    description: "Route tunnel traffic to this service (set to 'true' to use the active kindling tunnel hostname as the ingress host)"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -78,8 +82,22 @@ runs:
         DSE_SVC_TYPE: ${{ inputs.service-type }}
         DSE_WAIT: ${{ inputs.wait }}
         DSE_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        DSE_TUNNEL: ${{ inputs.tunnel }}
       run: |
         echo "🚀 Deploying ${DSE_NAME}"
+
+        # ── Tunnel override ──────────────────────────────────────
+        # If tunnel: true and a kindling tunnel is active, replace the
+        # ingress host with the tunnel hostname so external traffic
+        # (OAuth callbacks, webhooks, etc.) reaches this service.
+        if [ "${DSE_TUNNEL}" = "true" ] && [ -n "${DSE_INGRESS_HOST}" ]; then
+          TUNNEL_HOST=$(kubectl get configmap kindling-tunnel -o jsonpath='{.data.hostname}' 2>/dev/null || true)
+          if [ -n "${TUNNEL_HOST}" ]; then
+            echo "🔗 Tunnel active — routing tunnel traffic to ${DSE_NAME}"
+            echo "   ${DSE_INGRESS_HOST} → ${TUNNEL_HOST}"
+            DSE_INGRESS_HOST="${TUNNEL_HOST}"
+          fi
+        fi
 
         # ── Generate DSE YAML ────────────────────────────────────
         YAML_FILE="/builds/${DSE_NAME}-dse.yaml"
