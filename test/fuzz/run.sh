@@ -235,13 +235,68 @@ for b in d.get('builds', []):
       continue
     fi
 
+    # ── 5a. LLM pre-build analysis: fix the Dockerfile before building ──
+    local original_dockerfile="${dockerfile}.original"
+    cp "$dockerfile" "$original_dockerfile"
+
+    log "FIX" "analyzing Dockerfile for ${build_name} via LLM..."
+    local fixed_dockerfile
+    if fixed_dockerfile=$(python3 "$SCRIPT_DIR/fix-dockerfile.py" \
+        --dockerfile "$dockerfile" \
+        --context-dir "$build_dir" 2>"$repo_log.fix.${build_name}.log"); then
+      echo "$fixed_dockerfile" > "$dockerfile"
+      log "FIX" "LLM pre-build fix applied for ${build_name}"
+    else
+      log "FIX" "LLM pre-build analysis failed — using original Dockerfile"
+      cp "$original_dockerfile" "$dockerfile"
+    fi
+
+    # ── 5b. Build (attempt 1) ──────────────────────────────────
     t0=$(now_ms)
+    local build_success=false
+
     if timeout "$TIMEOUT_BUILD" docker build -t "$img_tag" -f "$dockerfile" "$build_dir" \
         >"$repo_log.build.${build_name}.log" 2>&1; then
       dur=$(( $(now_ms) - t0 ))
+      build_success=true
+      log "PASS" "build ${build_name} (${dur}ms)"
+    else
+      dur=$(( $(now_ms) - t0 ))
+      local build_err
+      build_err=$(tail -20 "$repo_log.build.${build_name}.log" 2>/dev/null | tr '\n' ' ' | cut -c1-500)
+      log "FAIL" "build ${build_name} — attempting LLM retry fix..."
+
+      # ── 5c. Retry: feed error back to LLM ─────────────────────
+      local retry_dockerfile
+      if retry_dockerfile=$(python3 "$SCRIPT_DIR/fix-dockerfile.py" \
+          --dockerfile "$original_dockerfile" \
+          --context-dir "$build_dir" \
+          --build-error "$build_err" 2>>"$repo_log.fix.${build_name}.log"); then
+        echo "$retry_dockerfile" > "$dockerfile"
+        log "FIX" "LLM retry fix applied for ${build_name} — rebuilding..."
+
+        t0=$(now_ms)
+        if timeout "$TIMEOUT_BUILD" docker build -t "$img_tag" -f "$dockerfile" "$build_dir" \
+            >"$repo_log.build.${build_name}.retry.log" 2>&1; then
+          dur=$(( $(now_ms) - t0 ))
+          build_success=true
+          log "PASS" "build ${build_name} (retry, ${dur}ms)"
+        else
+          dur=$(( $(now_ms) - t0 ))
+          log "FAIL" "build ${build_name} — retry also failed"
+        fi
+      else
+        log "FIX" "LLM retry fix failed — no more attempts"
+      fi
+    fi
+
+    # Restore original so we don't leave modified files around
+    cp "$original_dockerfile" "$dockerfile"
+    rm -f "$original_dockerfile"
+
+    if $build_success; then
       BUILD_OK=$((BUILD_OK + 1))
       emit "$repo_url" "docker_build" "pass" "${build_name} (${dur}ms)" "$dur"
-      log "PASS" "build ${build_name} (${dur}ms)"
 
       # Load into Kind cluster
       if ! kind load docker-image "$img_tag" --name "$CLUSTER_NAME" >/dev/null 2>&1; then
@@ -250,9 +305,7 @@ for b in d.get('builds', []):
         all_builds_ok=false
       fi
     else
-      dur=$(( $(now_ms) - t0 ))
       all_builds_ok=false
-      local build_err
       build_err=$(tail -5 "$repo_log.build.${build_name}.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)
       emit "$repo_url" "docker_build" "fail" "${build_name} — $build_err" "$dur"
       log "FAIL" "build ${build_name}"
