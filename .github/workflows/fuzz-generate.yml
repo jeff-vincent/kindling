@@ -1,7 +1,8 @@
 # ─────────────────────────────────────────────────────────────────
 # fuzz-generate.yml — Weekly fuzz-test kindling generate against
-# real-world repos to surface workflow generation issues,
-# especially cross-service networking mismatches.
+# real-world repos. Full e2e: generate → static analysis →
+# docker build → deploy DSE CRs to Kind → cross-service
+# networking validation from inside pods.
 # ─────────────────────────────────────────────────────────────────
 name: Fuzz Test – kindling generate
 
@@ -19,6 +20,11 @@ on:
         required: false
         default: "openai"
         type: string
+      skip_e2e:
+        description: "Skip cluster deploy, static analysis only"
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   contents: read
@@ -26,13 +32,15 @@ permissions:
 
 env:
   GO_VERSION: "1.23"
+  FUZZ_CLUSTER: "fuzz"
 
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
+      # ── Setup ────────────────────────────────────────────────
       - name: Checkout kindling
         uses: actions/checkout@v4
 
@@ -58,6 +66,51 @@ jobs:
       - name: Install Python deps
         run: pip install pyyaml
 
+      # ── Bootstrap Kind cluster with kindling operator ────────
+      - name: Install Kind
+        if: ${{ inputs.skip_e2e != '1' }}
+        run: |
+          [ -f /usr/local/bin/kind ] && exit 0
+          curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x /usr/local/bin/kind
+
+      - name: Create Kind cluster
+        if: ${{ inputs.skip_e2e != '1' }}
+        run: |
+          kind create cluster --name ${{ env.FUZZ_CLUSTER }} \
+            --config kind-config.yaml \
+            --wait 120s
+
+      - name: Install ingress + registry
+        if: ${{ inputs.skip_e2e != '1' }}
+        run: bash setup-ingress.sh
+
+      - name: Build and deploy kindling operator
+        if: ${{ inputs.skip_e2e != '1' }}
+        run: |
+          # Build operator image
+          docker build -t controller:latest .
+          kind load docker-image controller:latest --name ${{ env.FUZZ_CLUSTER }}
+
+          # Install CRDs
+          kubectl apply -f config/crd/bases/
+
+          # Deploy operator via kustomize
+          cd config/manager && kustomize edit set image controller=controller:latest && cd ../..
+          kustomize build config/default | kubectl apply -f -
+
+          # Wait for operator
+          kubectl rollout status deployment/kindling-controller-manager \
+            -n kindling-system --timeout=120s
+
+      - name: Verify cluster ready
+        if: ${{ inputs.skip_e2e != '1' }}
+        run: |
+          kubectl get crd devstagingenvironments.apps.example.com
+          kubectl get pods -n kindling-system
+          echo "✅ Kind cluster with kindling operator ready"
+
+      # ── Run fuzz harness ─────────────────────────────────────
       - name: Prepare repo list
         id: repos
         run: |
@@ -74,9 +127,22 @@ jobs:
           FUZZ_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           FUZZ_MODEL: ""
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FUZZ_CLUSTER: ${{ env.FUZZ_CLUSTER }}
+          SKIP_E2E: ${{ inputs.skip_e2e || '0' }}
         run: |
           chmod +x test/fuzz/run.sh
           test/fuzz/run.sh /tmp/repos.txt /tmp/fuzz-results bin/kindling
+
+      # ── Collect results ──────────────────────────────────────
+      - name: Capture cluster state (on failure)
+        if: failure() && inputs.skip_e2e != '1'
+        run: |
+          echo "=== Pods ===" > /tmp/fuzz-results/cluster-state.log
+          kubectl get pods -A >> /tmp/fuzz-results/cluster-state.log 2>&1
+          echo "=== DSEs ===" >> /tmp/fuzz-results/cluster-state.log
+          kubectl get dse -A >> /tmp/fuzz-results/cluster-state.log 2>&1
+          echo "=== Events ===" >> /tmp/fuzz-results/cluster-state.log
+          kubectl get events --sort-by=.lastTimestamp | tail -50 >> /tmp/fuzz-results/cluster-state.log 2>&1
 
       - name: Upload results artifact
         if: always()
@@ -97,13 +163,11 @@ jobs:
           summary_file = os.path.join(output_dir, "summary.json")
           results_file = os.path.join(output_dir, "results.jsonl")
 
-          # Load summary
           summary = {}
           if os.path.exists(summary_file):
               with open(summary_file) as f:
                   summary = json.load(f)
 
-          # Load per-repo results
           results = []
           if os.path.exists(results_file):
               with open(results_file) as f:
@@ -115,7 +179,6 @@ jobs:
                           except json.JSONDecodeError:
                               pass
 
-          # Build markdown
           today = datetime.date.today().isoformat()
           md = []
           md.append(f"## 🔬 Fuzz Test Results — {today}\n")
@@ -124,33 +187,44 @@ jobs:
                     f"/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')})\n")
 
           md.append("### Summary\n")
-          md.append(f"| Metric | Count |")
-          md.append(f"|--------|-------|")
+          md.append("| Metric | Count |")
+          md.append("|--------|-------|")
           md.append(f"| Repos tested | {summary.get('total', '?')} |")
           md.append(f"| Generate OK | {summary.get('generate_ok', '?')} ({summary.get('generate_rate', '?')}) |")
           md.append(f"| Valid YAML | {summary.get('yaml_ok', '?')} |")
-          md.append(f"| Networking clean | {summary.get('network_ok', '?')} ({summary.get('network_rate', '?')}) |")
+          md.append(f"| Static analysis clean | {summary.get('static_net_ok', '?')} |")
           md.append(f"| Docker build OK | {summary.get('build_ok', '?')} |")
-          md.append(f"| Health check OK | {summary.get('health_ok', '?')} |")
+          md.append(f"| Deploy (DSE) OK | {summary.get('deploy_ok', '?')} |")
+          md.append(f"| **e2e networking OK** | **{summary.get('e2e_ok', '?')}** ({summary.get('e2e_rate', '?')}) |")
           md.append("")
 
-          # Group results by repo
-          by_repo = {}
-          for r in results:
-              repo = r.get("repo", "unknown")
-              if repo not in by_repo:
-                  by_repo[repo] = []
-              by_repo[repo].append(r)
+          # e2e failures section
+          e2e_issues = [r for r in results
+                        if r.get("stage") == "e2e"
+                        and r.get("status") == "fail"]
+          if e2e_issues:
+              md.append("### 🔴 e2e Networking Failures\n")
+              for r in e2e_issues:
+                  repo_short = r["repo"].split("/")[-1]
+                  issues = r.get("issues", [])
+                  if isinstance(issues, list) and issues:
+                      md.append(f"<details><summary><b>{repo_short}</b> — {len(issues)} failures</summary>\n")
+                      for issue in issues:
+                          md.append(f"- **{issue.get('type', '?')}** ({issue.get('service', '?')}): "
+                                    f"{issue.get('detail', '')}")
+                      md.append(f"\n</details>\n")
+                  else:
+                      md.append(f"- **{repo_short}**: {r.get('detail', '')[:200]}")
+              md.append("")
 
-          # Networking issues section
-          net_issues = [r for r in results
-                        if r.get("stage") == "network_validate"
-                        and r.get("issues") and r.get("issues") != "[]"
-                        and isinstance(r.get("issues"), list) and len(r["issues"]) > 0]
-
-          if net_issues:
-              md.append("### ⚠️ Networking Issues\n")
-              for r in net_issues:
+          # Static analysis issues
+          static_issues = [r for r in results
+                           if r.get("stage") == "static_analysis"
+                           and r.get("issues") and r.get("issues") != "[]"
+                           and isinstance(r.get("issues"), list) and len(r["issues"]) > 0]
+          if static_issues:
+              md.append("### ⚠️ Static Networking Issues\n")
+              for r in static_issues:
                   repo_short = r["repo"].split("/")[-1]
                   md.append(f"<details><summary><b>{repo_short}</b> — {len(r['issues'])} issues</summary>\n")
                   for issue in r["issues"]:
@@ -159,25 +233,24 @@ jobs:
                                 f"{issue.get('detail', '')}")
                   md.append(f"\n</details>\n")
 
-          # Failures section
-          failures = [r for r in results if r.get("status") == "fail"]
+          # Other failures
+          failures = [r for r in results
+                      if r.get("status") == "fail"
+                      and r.get("stage") not in ("e2e",)]
           if failures:
-              md.append("### ❌ Failures\n")
+              md.append("### ❌ Other Failures\n")
               for r in failures:
                   repo_short = r["repo"].split("/")[-1]
                   md.append(f"- **{repo_short}** → `{r.get('stage', '?')}`: {r.get('detail', '')[:150]}")
               md.append("")
 
           body = "\n".join(md)
-
-          # Write to file for the issue action
           with open("/tmp/issue-body.md", "w") as f:
               f.write(body)
 
-          # Determine title
           total = summary.get("total", 0)
-          net_ok = summary.get("network_ok", 0)
-          title = f"Fuzz results {today}: {net_ok}/{total} repos networking clean"
+          e2e = summary.get("e2e_ok", "?")
+          title = f"Fuzz e2e results {today}: {e2e}/{total} repos networking clean"
           with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
               f.write(f"title={title}\n")
           PYEOF
@@ -200,3 +273,8 @@ jobs:
           labels: |
             fuzz-test
             automated
+
+      # ── Cleanup ──────────────────────────────────────────────
+      - name: Delete Kind cluster
+        if: always() && inputs.skip_e2e != '1'
+        run: kind delete cluster --name ${{ env.FUZZ_CLUSTER }} || true

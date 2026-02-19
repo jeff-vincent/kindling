@@ -1,34 +1,56 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
-# run.sh — Fuzz-test kindling generate against a list of real repos
+# run.sh — Full e2e fuzz-test for kindling generate
 #
 # For each repo:
 #   1. Shallow-clone
 #   2. Run kindling generate --dry-run
 #   3. Validate the generated YAML
-#   4. Parse services, ports, health checks, env vars
-#   5. Cross-validate networking (port mismatches, dangling refs)
-#   6. Docker build each Dockerfile
-#   7. Docker run + health check each container
-#   8. Write structured results to results.jsonl
+#   4. Static networking analysis (port mismatches, dangling refs)
+#   5. Docker build each service image
+#   6. kind load docker-image into the cluster
+#   7. Convert workflow → DSE manifests, kubectl apply
+#   8. Wait for all DSEs to become Ready
+#   9. e2e networking validation: exec into pods, curl health
+#      endpoints + inter-service URLs
+#  10. Cleanup: delete DSE CRs (cascade deletes everything)
+#
+# Prerequisites:
+#   - Kind cluster running with kindling operator installed
+#     (run `kindling init` first, or let the GH Actions workflow
+#      handle it)
+#   - Docker, kubectl, kind on PATH
+#   - Python 3 + pyyaml
 #
 # Usage:
 #   ./run.sh <repos.txt> <output-dir> [kindling-binary]
+#
+# Env vars:
+#   FUZZ_PROVIDER   LLM provider for generate (default: openai)
+#   FUZZ_API_KEY    API key (falls back to OPENAI_API_KEY)
+#   FUZZ_MODEL      Model override (optional)
+#   FUZZ_CLUSTER    Kind cluster name (default: fuzz)
+#   FUZZ_NAMESPACE  Namespace for DSE deployments (default: default)
+#   SKIP_E2E        Set to 1 to skip cluster deploy (static only)
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 REPOS_FILE="${1:?Usage: run.sh <repos.txt> <output-dir> [kindling-binary]}"
 OUTPUT_DIR="${2:?Usage: run.sh <repos.txt> <output-dir> [kindling-binary]}"
 KINDLING="${3:-kindling}"
+CLUSTER_NAME="${FUZZ_CLUSTER:-fuzz}"
+NAMESPACE="${FUZZ_NAMESPACE:-default}"
 TIMEOUT_BUILD=300   # 5 min per docker build
-TIMEOUT_RUN=30      # 30s for container startup + health check
+TIMEOUT_READY=180   # 3 min for DSE to become Ready
+SKIP_E2E="${SKIP_E2E:-0}"
 
 mkdir -p "$OUTPUT_DIR"
 RESULTS="$OUTPUT_DIR/results.jsonl"
 : > "$RESULTS"
 
 # Counters
-TOTAL=0; GENERATE_OK=0; YAML_OK=0; BUILD_OK=0; HEALTH_OK=0; NETWORK_OK=0
+TOTAL=0; GENERATE_OK=0; YAML_OK=0; STATIC_NET_OK=0
+BUILD_OK=0; DEPLOY_OK=0; E2E_OK=0
 
 # ── Helpers ──────────────────────────────────────────────────────
 
@@ -44,13 +66,6 @@ emit() {
     >> "$RESULTS"
 }
 
-# Extract EXPOSE ports from a Dockerfile
-dockerfile_ports() {
-  local dockerfile="$1"
-  grep -i '^EXPOSE' "$dockerfile" 2>/dev/null \
-    | sed 's/EXPOSE//i' | tr -s ' /' '\n' | grep -E '^[0-9]+' | sort -u || true
-}
-
 # ── Per-repo test ────────────────────────────────────────────────
 
 test_repo() {
@@ -59,14 +74,16 @@ test_repo() {
   repo_name=$(echo "$repo_url" | sed 's|.*/||; s|\.git$||')
   local clone_dir="$OUTPUT_DIR/repos/$repo_name"
   local workflow_file="$OUTPUT_DIR/workflows/${repo_name}.yml"
-  local issues="[]"
+  local dse_file="$OUTPUT_DIR/dse/${repo_name}.yaml"
+  local repo_log="$OUTPUT_DIR/logs/${repo_name}"
 
   TOTAL=$((TOTAL + 1))
+  log "REPO" "════════════════════════════════════════"
   log "REPO" "[$TOTAL] $repo_url"
 
   # ── 1. Clone ─────────────────────────────────────────────────
   rm -rf "$clone_dir"
-  mkdir -p "$clone_dir"
+  mkdir -p "$clone_dir" "$OUTPUT_DIR/workflows" "$OUTPUT_DIR/dse" "$OUTPUT_DIR/logs"
   local t0; t0=$(now_ms)
 
   if ! git clone --depth=1 --single-branch -q "$repo_url" "$clone_dir" 2>/dev/null; then
@@ -76,10 +93,9 @@ test_repo() {
     return
   fi
 
-  # ── 2. Generate workflow ─────────────────────────────────────
-  mkdir -p "$OUTPUT_DIR/workflows"
+  # ── 2. Generate workflow (the thing we're testing) ───────────
   t0=$(now_ms)
-  local gen_stderr="$OUTPUT_DIR/workflows/${repo_name}.stderr"
+  local gen_stderr="$repo_log.generate.stderr"
 
   if "$KINDLING" generate \
       --repo "$clone_dir" \
@@ -121,151 +137,370 @@ if 'jobs' not in data:
   YAML_OK=$((YAML_OK + 1))
   emit "$repo_url" "yaml_validate" "pass" "" "$dur"
 
-  # ── 4. Parse services and cross-validate networking ──────────
+  # ── 4. Static analysis + emit DSE CRs ───────────────────────
+  #     analyze.py parses the generated workflow, cross-validates
+  #     networking (the core test of generate quality), and writes
+  #     DSE manifests we can kubectl apply directly.
   t0=$(now_ms)
   local analysis
-  analysis=$(python3 "$SCRIPT_DIR/analyze.py" "$workflow_file" "$clone_dir" 2>/dev/null) || true
+  analysis=$(python3 "$SCRIPT_DIR/analyze.py" \
+    "$workflow_file" "$clone_dir" \
+    --emit-dse "$dse_file" \
+    --prefix "$repo_name" \
+    2>/dev/null) || true
 
   if [ -n "$analysis" ]; then
-    local svc_count net_issues
+    local svc_count net_issues issue_count
     svc_count=$(echo "$analysis" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('services_count',0))" 2>/dev/null || echo 0)
     net_issues=$(echo "$analysis" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('issues',[])))" 2>/dev/null || echo "[]")
-    local issue_count
     issue_count=$(echo "$net_issues" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
 
     dur=$(( $(now_ms) - t0 ))
     if [ "$issue_count" -eq 0 ]; then
-      NETWORK_OK=$((NETWORK_OK + 1))
-      emit "$repo_url" "network_validate" "pass" "${svc_count} services, 0 issues" "$dur" "$svc_count" "$net_issues"
-      log "PASS" "networking — ${svc_count} services, 0 issues"
+      STATIC_NET_OK=$((STATIC_NET_OK + 1))
+      emit "$repo_url" "static_analysis" "pass" "${svc_count} services, 0 issues" "$dur" "$svc_count" "$net_issues"
+      log "PASS" "static analysis — ${svc_count} services, 0 issues"
     else
-      emit "$repo_url" "network_validate" "warn" "${svc_count} services, ${issue_count} issues" "$dur" "$svc_count" "$net_issues"
-      log "WARN" "networking — ${svc_count} services, ${issue_count} issues"
+      emit "$repo_url" "static_analysis" "warn" "${svc_count} services, ${issue_count} issues" "$dur" "$svc_count" "$net_issues"
+      log "WARN" "static analysis — ${svc_count} services, ${issue_count} issues"
     fi
   else
     dur=$(( $(now_ms) - t0 ))
-    emit "$repo_url" "network_validate" "skip" "analysis script failed" "$dur"
-    log "SKIP" "networking analysis failed"
+    emit "$repo_url" "static_analysis" "skip" "analyze.py failed" "$dur"
+    log "SKIP" "static analysis failed"
+    # Can't continue to e2e without DSE manifests
+    rm -rf "$clone_dir"
+    return
   fi
 
-  # ── 5. Docker build each Dockerfile ──────────────────────────
-  local dockerfiles
-  dockerfiles=$(find "$clone_dir" -name Dockerfile -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null | head -10)
+  # ── If SKIP_E2E, stop here ──────────────────────────────────
+  if [ "$SKIP_E2E" = "1" ]; then
+    log "SKIP" "e2e disabled (SKIP_E2E=1)"
+    rm -rf "$clone_dir"
+    return
+  fi
 
-  if [ -z "$dockerfiles" ]; then
-    emit "$repo_url" "docker_build" "skip" "no Dockerfiles found" "0"
-    log "SKIP" "no Dockerfiles"
+  # ── 5. Docker build images using contexts from the workflow ──
+  local builds_json
+  builds_json=$(echo "$analysis" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for b in d.get('builds', []):
+    print(json.dumps(b))
+" 2>/dev/null) || true
+
+  if [ -z "$builds_json" ]; then
+    emit "$repo_url" "docker_build" "skip" "no build steps in workflow" "0"
+    log "SKIP" "no build steps"
+    rm -rf "$clone_dir"
     return
   fi
 
   local all_builds_ok=true
-  while IFS= read -r df; do
-    local df_rel="${df#$clone_dir/}"
-    local ctx_dir
-    ctx_dir=$(dirname "$df")
-    local img_tag="fuzz-${repo_name}-$(echo "$df_rel" | tr '/' '-' | tr '[:upper:]' '[:lower:]'):test"
+  while IFS= read -r build_line; do
+    local build_name build_ctx img_tag
+    build_name=$(echo "$build_line" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])" 2>/dev/null)
+    build_ctx=$(echo "$build_line" | python3 -c "import sys,json; print(json.load(sys.stdin)['context'])" 2>/dev/null)
+    img_tag="${repo_name}-${build_name}:test"
+
+    local build_dir="$clone_dir/$build_ctx"
+    local dockerfile="$build_dir/Dockerfile"
+
+    if [ ! -f "$dockerfile" ]; then
+      # Try lowercase
+      dockerfile="$build_dir/dockerfile"
+    fi
+    if [ ! -f "$dockerfile" ]; then
+      emit "$repo_url" "docker_build" "skip" "${build_name}: no Dockerfile at ${build_ctx}" "0"
+      log "SKIP" "build ${build_name} — no Dockerfile at ${build_ctx}"
+      all_builds_ok=false
+      continue
+    fi
 
     t0=$(now_ms)
-    if timeout "$TIMEOUT_BUILD" docker build -t "$img_tag" -f "$df" "$ctx_dir" \
-        >/dev/null 2>"$OUTPUT_DIR/workflows/${repo_name}.build.log"; then
+    if timeout "$TIMEOUT_BUILD" docker build -t "$img_tag" -f "$dockerfile" "$build_dir" \
+        >"$repo_log.build.${build_name}.log" 2>&1; then
       dur=$(( $(now_ms) - t0 ))
       BUILD_OK=$((BUILD_OK + 1))
-      emit "$repo_url" "docker_build" "pass" "$df_rel (${dur}ms)" "$dur"
-      log "PASS" "build $df_rel (${dur}ms)"
+      emit "$repo_url" "docker_build" "pass" "${build_name} (${dur}ms)" "$dur"
+      log "PASS" "build ${build_name} (${dur}ms)"
 
-      # ── 6. Docker run + health check ──────────────────────
-      # Find the port: check workflow first, fall back to EXPOSE
-      local port
-      port=$(dockerfile_ports "$df" | head -1)
-      if [ -z "$port" ]; then
-        port="8080"  # common default
+      # Load into Kind cluster
+      if ! kind load docker-image "$img_tag" --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+        emit "$repo_url" "kind_load" "fail" "${build_name}" "0"
+        log "FAIL" "kind load ${build_name}"
+        all_builds_ok=false
       fi
-
-      # Find health check path from the generated workflow
-      local health_path="/"
-      if [ -n "$analysis" ]; then
-        local hp
-        hp=$(echo "$analysis" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-# find a service whose context matches this Dockerfile's directory
-df_rel = '$df_rel'
-for svc in d.get('services', []):
-    ctx = svc.get('context', '')
-    if df_rel.startswith(ctx) or ctx.endswith(df_rel.replace('/Dockerfile','')):
-        print(svc.get('health_check_path', '/'))
-        sys.exit(0)
-print('/')
-" 2>/dev/null || echo "/")
-        health_path="$hp"
-      fi
-
-      t0=$(now_ms)
-      local container_id
-      container_id=$(docker run -d --rm -p "0:$port" "$img_tag" 2>/dev/null) || true
-
-      if [ -n "$container_id" ]; then
-        # Find the mapped host port
-        local host_port
-        host_port=$(docker port "$container_id" "$port" 2>/dev/null | head -1 | sed 's/.*://') || true
-
-        if [ -n "$host_port" ]; then
-          # Wait for health check
-          local healthy=false
-          for i in $(seq 1 "$TIMEOUT_RUN"); do
-            if curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:${host_port}${health_path}" 2>/dev/null; then
-              healthy=true
-              break
-            fi
-            sleep 1
-          done
-
-          dur=$(( $(now_ms) - t0 ))
-          if $healthy; then
-            HEALTH_OK=$((HEALTH_OK + 1))
-            emit "$repo_url" "health_check" "pass" "$df_rel → :${port}${health_path}" "$dur"
-            log "PASS" "health $df_rel → :${port}${health_path} (${dur}ms)"
-          else
-            emit "$repo_url" "health_check" "fail" "$df_rel → :${port}${health_path} (timeout ${TIMEOUT_RUN}s)" "$dur"
-            log "FAIL" "health $df_rel → :${port}${health_path} (timeout)"
-          fi
-        else
-          dur=$(( $(now_ms) - t0 ))
-          emit "$repo_url" "health_check" "fail" "$df_rel — could not map port $port" "$dur"
-          log "FAIL" "health — port map failed"
-        fi
-
-        docker stop "$container_id" >/dev/null 2>&1 || true
-      else
-        dur=$(( $(now_ms) - t0 ))
-        emit "$repo_url" "health_check" "fail" "$df_rel — container failed to start" "$dur"
-        log "FAIL" "health — container failed to start"
-      fi
-
-      # Cleanup image
-      docker rmi -f "$img_tag" >/dev/null 2>&1 || true
     else
       dur=$(( $(now_ms) - t0 ))
       all_builds_ok=false
       local build_err
-      build_err=$(tail -5 "$OUTPUT_DIR/workflows/${repo_name}.build.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)
-      emit "$repo_url" "docker_build" "fail" "$df_rel — $build_err" "$dur"
-      log "FAIL" "build $df_rel"
+      build_err=$(tail -5 "$repo_log.build.${build_name}.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)
+      emit "$repo_url" "docker_build" "fail" "${build_name} — $build_err" "$dur"
+      log "FAIL" "build ${build_name}"
     fi
-  done <<< "$dockerfiles"
+  done <<< "$builds_json"
 
-  # Cleanup clone
+  if ! $all_builds_ok; then
+    log "WARN" "some builds failed — deploying what we can"
+  fi
+
+  # ── 6. Apply DSE manifests to the Kind cluster ──────────────
+  if [ ! -f "$dse_file" ] || [ ! -s "$dse_file" ]; then
+    emit "$repo_url" "deploy" "skip" "no DSE manifests generated" "0"
+    log "SKIP" "no DSE manifests"
+    rm -rf "$clone_dir"
+    return
+  fi
+
+  t0=$(now_ms)
+  if kubectl apply -f "$dse_file" -n "$NAMESPACE" \
+      >"$repo_log.deploy.log" 2>&1; then
+    dur=$(( $(now_ms) - t0 ))
+    emit "$repo_url" "deploy" "pass" "DSE manifests applied" "$dur"
+    log "PASS" "kubectl apply DSE manifests"
+  else
+    dur=$(( $(now_ms) - t0 ))
+    local deploy_err
+    deploy_err=$(tail -5 "$repo_log.deploy.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)
+    emit "$repo_url" "deploy" "fail" "$deploy_err" "$dur"
+    log "FAIL" "kubectl apply — $deploy_err"
+    cleanup_dse "$repo_name"
+    rm -rf "$clone_dir"
+    return
+  fi
+
+  # ── 7. Wait for all DSEs to become Ready ────────────────────
+  t0=$(now_ms)
+  local dse_names
+  dse_names=$(kubectl get dse -n "$NAMESPACE" \
+    -l "kindling-fuzz/prefix=$repo_name" \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+  local all_ready=true
+  for dse_name in $dse_names; do
+    log "WAIT" "waiting for DSE $dse_name (up to ${TIMEOUT_READY}s)..."
+
+    # Wait for deployment rollout
+    if ! kubectl rollout status "deployment/$dse_name" \
+        -n "$NAMESPACE" --timeout="${TIMEOUT_READY}s" \
+        >"$repo_log.rollout.${dse_name}.log" 2>&1; then
+      all_ready=false
+      emit "$repo_url" "rollout" "fail" "$dse_name did not become ready" "0"
+      log "FAIL" "rollout $dse_name"
+
+      # Capture diagnostics
+      kubectl get pods -n "$NAMESPACE" -l "app=$dse_name" -o wide \
+        >"$repo_log.pods.${dse_name}.log" 2>&1 || true
+      kubectl logs -n "$NAMESPACE" -l "app=$dse_name" --tail=30 \
+        >"$repo_log.podlogs.${dse_name}.log" 2>&1 || true
+    else
+      log "PASS" "rollout $dse_name ready"
+    fi
+  done
+
+  dur=$(( $(now_ms) - t0 ))
+  if $all_ready; then
+    DEPLOY_OK=$((DEPLOY_OK + 1))
+    emit "$repo_url" "rollout" "pass" "all DSEs ready" "$dur"
+    log "PASS" "all DSEs ready (${dur}ms)"
+  else
+    emit "$repo_url" "rollout" "partial" "some DSEs failed to roll out" "$dur"
+    log "WARN" "partial rollout"
+  fi
+
+  # ── 8. e2e networking validation ─────────────────────────────
+  #     For each service: exec into its pod and:
+  #       a) curl its own health check (sanity)
+  #       b) curl every URL in its env vars (the real test)
+  t0=$(now_ms)
+  local e2e_pass=0 e2e_fail=0 e2e_issues="["
+
+  for dse_name in $dse_names; do
+    # Get a running pod for this DSE
+    local pod
+    pod=$(kubectl get pods -n "$NAMESPACE" -l "app=$dse_name" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
+    if [ -z "$pod" ]; then
+      log "SKIP" "e2e $dse_name — no pod found"
+      continue
+    fi
+
+    # Check pod is Running
+    local phase
+    phase=$(kubectl get pod "$pod" -n "$NAMESPACE" \
+      -o jsonpath='{.status.phase}' 2>/dev/null) || true
+    if [ "$phase" != "Running" ]; then
+      log "SKIP" "e2e $dse_name — pod $phase"
+      continue
+    fi
+
+    # Get service info from the DSE analysis
+    local svc_port svc_health svc_envs
+    svc_port=$(echo "$analysis" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+name = '$dse_name'
+for svc in d.get('services', []):
+    if svc['name'] == name:
+        print(svc.get('port', '8080'))
+        break
+else:
+    print('8080')
+" 2>/dev/null || echo "8080")
+
+    svc_health=$(echo "$analysis" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+name = '$dse_name'
+for svc in d.get('services', []):
+    if svc['name'] == name:
+        print(svc.get('health_check_path', '/'))
+        break
+else:
+    print('/')
+" 2>/dev/null || echo "/")
+
+    # a) Self health check: curl from inside the pod
+    log "E2E" "$dse_name → self :${svc_port}${svc_health}"
+    local self_result
+    self_result=$(kubectl exec "$pod" -n "$NAMESPACE" -- \
+      sh -c "wget -q -O /dev/null -T 5 http://localhost:${svc_port}${svc_health} 2>&1 && echo OK || echo FAIL" \
+      2>/dev/null) || self_result="EXEC_FAIL"
+
+    if echo "$self_result" | grep -q "OK"; then
+      e2e_pass=$((e2e_pass + 1))
+      log "PASS" "e2e $dse_name → self health OK"
+    else
+      e2e_fail=$((e2e_fail + 1))
+      [ "$e2e_issues" != "[" ] && e2e_issues="$e2e_issues,"
+      e2e_issues="$e2e_issues{\"service\":\"$dse_name\",\"type\":\"self_health\",\"detail\":\"${svc_health} failed: $self_result\"}"
+      log "FAIL" "e2e $dse_name → self health FAIL ($self_result)"
+    fi
+
+    # b) Cross-service: curl every URL-like env var
+    svc_envs=$(echo "$analysis" | python3 -c "
+import sys, json, re
+d = json.load(sys.stdin)
+name = '$dse_name'
+for svc in d.get('services', []):
+    if svc['name'] == name:
+        for k, v in svc.get('env', {}).items():
+            # Clean github.actor templates
+            v = re.sub(r'\\\$\{\{\s*github\.actor\s*\}\}-', '', v)
+            v = re.sub(r'\\\$\{\{[^}]*\}\}', '', v)
+            # Only test HTTP(S) URLs
+            if re.match(r'https?://', v):
+                print(f'{k}={v}')
+        break
+" 2>/dev/null) || true
+
+    while IFS= read -r env_line; do
+      [ -z "$env_line" ] && continue
+      local env_name="${env_line%%=*}"
+      local env_url="${env_line#*=}"
+
+      # Append health check path of the target service if URL has no path
+      local url_to_test="$env_url"
+      # If the URL is just http://host:port with no path, try the target's health path
+      if echo "$url_to_test" | grep -qE '^https?://[^/]+$'; then
+        # Extract target service name from URL
+        local target_name
+        target_name=$(echo "$url_to_test" | sed -E 's|https?://||; s|:[0-9]+.*||')
+        local target_health
+        target_health=$(echo "$analysis" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+t = '$target_name'
+for svc in d.get('services', []):
+    if svc['name'] == t:
+        print(svc.get('health_check_path', '/'))
+        break
+else:
+    print('/')
+" 2>/dev/null || echo "/")
+        url_to_test="${url_to_test}${target_health}"
+      fi
+
+      log "E2E" "$dse_name → $env_name=$url_to_test"
+      local cross_result
+      cross_result=$(kubectl exec "$pod" -n "$NAMESPACE" -- \
+        sh -c "wget -q -O /dev/null -T 5 '$url_to_test' 2>&1 && echo OK || echo FAIL" \
+        2>/dev/null) || cross_result="EXEC_FAIL"
+
+      if echo "$cross_result" | grep -q "OK"; then
+        e2e_pass=$((e2e_pass + 1))
+        log "PASS" "e2e $dse_name → $env_name OK"
+      else
+        e2e_fail=$((e2e_fail + 1))
+        [ "$e2e_issues" != "[" ] && e2e_issues="$e2e_issues,"
+        e2e_issues="$e2e_issues{\"service\":\"$dse_name\",\"type\":\"cross_service\",\"env\":\"$env_name\",\"url\":\"$url_to_test\",\"detail\":\"$cross_result\"}"
+        log "FAIL" "e2e $dse_name → $env_name FAIL ($cross_result)"
+      fi
+    done <<< "$svc_envs"
+  done
+
+  e2e_issues="$e2e_issues]"
+  dur=$(( $(now_ms) - t0 ))
+
+  if [ "$e2e_fail" -eq 0 ] && [ "$e2e_pass" -gt 0 ]; then
+    E2E_OK=$((E2E_OK + 1))
+    emit "$repo_url" "e2e" "pass" "${e2e_pass} checks passed, 0 failed" "$dur" "0" "$e2e_issues"
+    log "PASS" "e2e networking — ${e2e_pass} passed, 0 failed"
+  elif [ "$e2e_pass" -eq 0 ] && [ "$e2e_fail" -eq 0 ]; then
+    emit "$repo_url" "e2e" "skip" "no testable endpoints" "$dur"
+    log "SKIP" "e2e — no testable endpoints"
+  else
+    emit "$repo_url" "e2e" "fail" "${e2e_pass} passed, ${e2e_fail} failed" "$dur" "0" "$e2e_issues"
+    log "FAIL" "e2e networking — ${e2e_pass} passed, ${e2e_fail} failed"
+  fi
+
+  # ── 9. Cleanup ──────────────────────────────────────────────
+  cleanup_dse "$repo_name"
   rm -rf "$clone_dir"
+}
+
+# ── Cleanup DSEs for a repo ──────────────────────────────────────
+
+cleanup_dse() {
+  local prefix="$1"
+  log "CLEAN" "deleting DSEs with prefix=$prefix"
+  kubectl delete dse -n "$NAMESPACE" -l "kindling-fuzz/prefix=$prefix" \
+    --timeout=60s >/dev/null 2>&1 || true
+  # Wait a moment for cascade deletion
+  sleep 3
+  # Force-delete any lingering pods
+  kubectl delete pods -n "$NAMESPACE" -l "kindling-fuzz/prefix=$prefix" \
+    --force --grace-period=0 >/dev/null 2>&1 || true
 }
 
 # ── Main ─────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-log "START" "Fuzz testing kindling generate"
+log "START" "Fuzz testing kindling generate (full e2e)"
 log "INFO" "Repos: $REPOS_FILE"
 log "INFO" "Output: $OUTPUT_DIR"
 log "INFO" "Kindling: $($KINDLING version 2>/dev/null || echo "$KINDLING")"
+log "INFO" "Cluster: $CLUSTER_NAME"
+log "INFO" "Namespace: $NAMESPACE"
+log "INFO" "Skip e2e: $SKIP_E2E"
+
+# Verify cluster is reachable (unless skip_e2e)
+if [ "$SKIP_E2E" != "1" ]; then
+  if ! kubectl cluster-info --context "kind-$CLUSTER_NAME" >/dev/null 2>&1; then
+    log "FATAL" "Kind cluster '$CLUSTER_NAME' is not reachable."
+    log "FATAL" "Run: kindling init   or   FUZZ_CLUSTER=dev ./run.sh ..."
+    log "FATAL" "Or set SKIP_E2E=1 for static-only mode."
+    exit 1
+  fi
+  # Verify CRDs are installed
+  if ! kubectl get crd devstagingenvironments.apps.example.com >/dev/null 2>&1; then
+    log "FATAL" "DSE CRD not installed. Run: kindling init"
+    exit 1
+  fi
+  log "PASS" "cluster reachable, CRDs installed"
+fi
 
 while IFS= read -r line; do
   # Skip comments and blank lines
@@ -277,12 +512,13 @@ done < "$REPOS_FILE"
 # ── Summary ──────────────────────────────────────────────────────
 
 log "DONE" "════════════════════════════════════════"
-log "DONE" "Total repos:       $TOTAL"
-log "DONE" "Generate OK:       $GENERATE_OK / $TOTAL"
-log "DONE" "Valid YAML:        $YAML_OK / $GENERATE_OK"
-log "DONE" "Networking clean:  $NETWORK_OK / $YAML_OK"
-log "DONE" "Docker build OK:   $BUILD_OK"
-log "DONE" "Health check OK:   $HEALTH_OK"
+log "DONE" "Total repos:         $TOTAL"
+log "DONE" "Generate OK:         $GENERATE_OK / $TOTAL"
+log "DONE" "Valid YAML:          $YAML_OK / $GENERATE_OK"
+log "DONE" "Static analysis OK:  $STATIC_NET_OK / $YAML_OK"
+log "DONE" "Docker build OK:     $BUILD_OK"
+log "DONE" "Deploy (DSE) OK:     $DEPLOY_OK / $YAML_OK"
+log "DONE" "e2e networking OK:   $E2E_OK / $DEPLOY_OK"
 log "DONE" "════════════════════════════════════════"
 
 # Write summary JSON
@@ -291,11 +527,12 @@ cat > "$OUTPUT_DIR/summary.json" <<EOF
   "total": $TOTAL,
   "generate_ok": $GENERATE_OK,
   "yaml_ok": $YAML_OK,
-  "network_ok": $NETWORK_OK,
+  "static_net_ok": $STATIC_NET_OK,
   "build_ok": $BUILD_OK,
-  "health_ok": $HEALTH_OK,
-  "generate_rate": "$(echo "scale=1; $GENERATE_OK * 100 / $TOTAL" | bc 2>/dev/null || echo "?")%",
-  "network_rate": "$([ "$YAML_OK" -gt 0 ] && echo "scale=1; $NETWORK_OK * 100 / $YAML_OK" | bc 2>/dev/null || echo "?")%"
+  "deploy_ok": $DEPLOY_OK,
+  "e2e_ok": $E2E_OK,
+  "generate_rate": "$([ "$TOTAL" -gt 0 ] && echo "scale=1; $GENERATE_OK * 100 / $TOTAL" | bc 2>/dev/null || echo "?")%",
+  "e2e_rate": "$([ "$DEPLOY_OK" -gt 0 ] && echo "scale=1; $E2E_OK * 100 / $DEPLOY_OK" | bc 2>/dev/null || echo "?")%"
 }
 EOF
 
