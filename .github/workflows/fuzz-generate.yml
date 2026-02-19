@@ -8,7 +8,7 @@ name: Fuzz Test – kindling generate
 
 on:
   # schedule:
-  #   - cron: "30 20 * * *"  # TEMP: one-shot test, revert to 0 8 */2 * *
+  #   - cron: "0 8 */2 * *"  # every other day, revert when push trigger removed
   push:
     branches: [main]
   workflow_dispatch:
@@ -71,8 +71,8 @@ jobs:
       - name: Install Kind
         if: ${{ inputs.skip_e2e != '1' }}
         run: |
-          [ -f /usr/local/bin/kind ] && exit 0
-          curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          [ -f /usr/local/bin/kind ] && kind version | grep -q 'v0.31' && exit 0
+          curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
           chmod +x /usr/local/bin/kind
 
       - name: Create Kind cluster

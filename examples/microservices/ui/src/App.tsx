@@ -88,10 +88,14 @@ export default function App() {
       ])
 
       if (statusRes.ok) setStatus(await statusRes.json())
-      if (ordersRes.ok) setOrders(await ordersRes.json())
+      if (ordersRes.ok) {
+        const data = await ordersRes.json()
+        setOrders(Array.isArray(data) ? data : data.orders ?? [])
+      }
 
       if (inventoryRes.ok) {
-        const items: InventoryItem[] = await inventoryRes.json()
+        const data = await inventoryRes.json()
+        const items: InventoryItem[] = Array.isArray(data) ? data : data.products ?? []
         setInventory(items)
 
         // Track stock deltas for the activity log

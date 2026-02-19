@@ -15,19 +15,30 @@ apiVersion: kind.x-k8s.io/v1alpha4
 
 # Tell containerd to mirror "registry:5000" → the local registry pod
 # running with hostNetwork on localhost:5000.
+# Uses config_path mode for containerd 2.x (Kind v0.27+).
 containerdConfigPatches:
   - |-
-    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry:5000"]
-      endpoint = ["http://localhost:5000"]
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
 
 nodes:
   - role: control-plane
     kubeadmConfigPatches:
+      # v1beta3 patch (k8s 1.23–1.35)
       - |
         kind: InitConfiguration
+        apiVersion: kubeadm.k8s.io/v1beta3
         nodeRegistration:
           kubeletExtraArgs:
             node-labels: "ingress-ready=true"
+      # v1beta4 patch (k8s 1.36+, extraArgs is a list)
+      - |
+        kind: InitConfiguration
+        apiVersion: kubeadm.k8s.io/v1beta4
+        nodeRegistration:
+          kubeletExtraArgs:
+            - name: "node-labels"
+              value: "ingress-ready=true"
     extraPortMappings:
       - containerPort: 80
         hostPort: 80
