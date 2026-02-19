@@ -62,8 +62,8 @@ flowchart LR
 |---|---|---|---|---|---|
 | **ui** | TypeScript (React) | 80 | `/` | — | Vite build → nginx. Standard. |
 | **gateway** | Go (stdlib) | 9090 | `/-/ready` | — | Config in separate `config.go`. Port via `LISTEN_ADDR`. Upstreams via `ORDERS_URL` / `INVENTORY_URL`. |
-| **orders** | Python (FastAPI) | 5000 | `/api/v1/health` | Postgres 16 | Config class in `config.py`. Postgres via `PG_DSN`. Redis via `QUEUE_URL`. Pydantic models. |
-| **inventory** | Node.js (Fastify) | 3000 | `/healthcheck` | MongoDB | Config in `config.js`. Port hardcoded. Mongo via `MONGODB_URI`. Redis via `EVENT_STORE_URL`. |
+| **orders** | Python (FastAPI) | 5000 | `/api/v1/health` | Postgres 16 | Config class in `config.py`. Reads `DATABASE_URL` and `REDIS_URL` directly. Pydantic models. |
+| **inventory** | Node.js (Fastify) | 3000 | `/healthcheck` | MongoDB | Config in `config.js`. Port hardcoded. Reads `MONGO_URL` directly. Redis via `EVENT_STORE_URL`. |
 
 ### Data flow
 
@@ -85,14 +85,14 @@ microservices/
 │   └── go.mod
 ├── orders/                     # Python (FastAPI)
 │   ├── main.py                 # Routes — POST/GET /orders, GET /api/v1/health
-│   ├── config.py               # Settings class — reads APP_PORT, PG_DSN, QUEUE_URL
+│   ├── config.py               # Settings class — reads DATABASE_URL, REDIS_URL
 │   ├── db.py                   # Postgres helpers (psycopg2)
 │   ├── queue.py                # Redis event publisher
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── inventory/                  # Node.js (Fastify)
 │   ├── server.js               # Fastify app — /inventory, /healthcheck
-│   ├── config.js               # Reads MONGODB_URI, EVENT_STORE_URL; hardcodes port 3000
+│   ├── config.js               # Reads MONGO_URL, EVENT_STORE_URL; hardcodes port 3000
 │   ├── package.json
 │   └── Dockerfile
 ├── ui/                         # TypeScript (React + Vite)
@@ -108,20 +108,20 @@ microservices/
 └── README.md
 ```
 
-### Why the env vars are different
+### Environment variables
 
-Each service uses its own naming convention — this is realistic for teams
-where different developers (or even different companies) wrote each service:
+Orders and Inventory read the standard env var names that the kindling
+operator injects (`DATABASE_URL`, `REDIS_URL`, `MONGO_URL`), so no
+remapping is needed in the deploy YAMLs.
 
-| What | Operator injects | Gateway reads | Orders reads | Inventory reads |
-|---|---|---|---|---|
-| Postgres DSN | `DATABASE_URL` | — | `PG_DSN` | — |
-| Redis URL | `REDIS_URL` | — | `QUEUE_URL` | `EVENT_STORE_URL` |
-| MongoDB URL | `MONGO_URL` | — | — | `MONGODB_URI` |
-| Orders upstream | — | `ORDERS_URL` | — | — |
-| Inventory upstream | — | `INVENTORY_URL` | — | — |
+The only custom env vars are inter-service references:
 
-The deploy YAMLs bridge the gap with env var mappings (e.g. `PG_DSN: $(DATABASE_URL)`).
+| Var | Service | Purpose |
+|---|---|---|
+| `ORDERS_URL` | gateway | HTTP address of the orders service |
+| `INVENTORY_URL` | gateway | HTTP address of the inventory service |
+| `EVENT_STORE_URL` | inventory | Redis URL for the shared order_events queue (points at orders' Redis) |
+| `GATEWAY_URL` | ui | HTTP address of the gateway for API calls |
 
 ## GitHub Actions Workflow
 
@@ -149,11 +149,6 @@ steps:
       image: "registry:5000/ms-orders:${{ env.TAG }}"
       port: "5000"
       health-check-path: "/api/v1/health"
-      env: |
-        - name: PG_DSN
-          value: "$(DATABASE_URL)"
-        - name: QUEUE_URL
-          value: "$(REDIS_URL)"
       dependencies: |
         - type: postgres
           version: "16"

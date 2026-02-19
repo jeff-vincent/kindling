@@ -21,13 +21,6 @@ spec:
     image: ms-orders:dev
     replicas: 1
     port: 5000
-    env:
-      # The app reads PG_DSN, not DATABASE_URL — map operator's injection
-      - name: PG_DSN
-        value: "$(DATABASE_URL)"
-      # The app reads QUEUE_URL, not REDIS_URL
-      - name: QUEUE_URL
-        value: "$(REDIS_URL)"
     healthCheck:
       path: /api/v1/health
 

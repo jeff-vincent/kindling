@@ -11,9 +11,9 @@ _conn = None
 def _get_conn():
     global _conn
     if _conn is None or _conn.closed:
-        if not settings.PG_DSN:
+        if not settings.DATABASE_URL:
             return None
-        _conn = psycopg2.connect(settings.PG_DSN)
+        _conn = psycopg2.connect(settings.DATABASE_URL)
         _conn.autocommit = True
         _bootstrap(_conn)
     return _conn
@@ -64,7 +64,7 @@ def recent_orders(limit: int = 50):
 def pg_ok() -> str:
     conn = _get_conn()
     if conn is None:
-        return "not configured (PG_DSN unset)"
+        return "not configured (DATABASE_URL unset)"
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT 1")

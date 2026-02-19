@@ -78,11 +78,6 @@ jobs:
             app.kubernetes.io/part-of: microservices-demo
             app.kubernetes.io/component: orders
             apps.example.com/github-username: ${{ github.actor }}
-          env: |
-            - name: PG_DSN
-              value: "$(DATABASE_URL)"
-            - name: QUEUE_URL
-              value: "$(REDIS_URL)"
           dependencies: |
             - type: postgres
               version: "16"
@@ -100,8 +95,6 @@ jobs:
             app.kubernetes.io/component: inventory
             apps.example.com/github-username: ${{ github.actor }}
           env: |
-            - name: MONGODB_URI
-              value: "$(MONGO_URL)"
             - name: EVENT_STORE_URL
               value: "redis://${{ github.actor }}-orders-redis:6379/0"
           dependencies: |

@@ -25,8 +25,8 @@ let redis = null;
 // ── Mongo ────────────────────────────────────────────────────────
 
 async function initMongo() {
-  if (!cfg.MONGODB_URI) return;
-  const client = new MongoClient(cfg.MONGODB_URI);
+  if (!cfg.MONGO_URL) return;
+  const client = new MongoClient(cfg.MONGO_URL);
   await client.connect();
   db = client.db("inventory");
   await seed();

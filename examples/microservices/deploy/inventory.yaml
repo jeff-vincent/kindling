@@ -29,10 +29,7 @@ spec:
     replicas: 1
     port: 3000
     env:
-      # The app reads MONGODB_URI, not MONGO_URL — map operator's injection
-      - name: MONGODB_URI
-        value: "$(MONGO_URL)"
-      # Share orders' Redis for the event queue; app reads EVENT_STORE_URL
+      # Share orders' Redis for the event queue
       - name: EVENT_STORE_URL
         value: "redis://microservices-orders-dev-redis:6379/0"
     healthCheck:
