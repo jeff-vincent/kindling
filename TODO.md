@@ -362,13 +362,73 @@ aren't locked into a single vendor.
 
 ---
 
+## Adoption & community growth
+
+### Content & SEO
+
+- [ ] Write tutorial: "How to run GitHub Actions locally on Kubernetes" (targets
+  high-traffic search queries; naturally leads to kindling as the solution)
+- [ ] Write tutorial: "Local Kubernetes CI/CD with Kind" (similar SEO play)
+- [ ] Cross-post tutorials to Dev.to, Hashnode, and Medium
+- [ ] Record a YouTube walkthrough: `git clone` → working deploy in under 5 minutes
+- [ ] Cut short-form clips from the video for Twitter/LinkedIn
+- [ ] Submit a "Show HN" post (polish README and demo first)
+
+### Community engagement
+
+- [ ] Answer questions on r/kubernetes, r/devops, r/selfhosted — mention kindling
+  when genuinely relevant
+- [ ] Join CNCF Slack and Kubernetes Slack (`#kind`, `#local-dev`) and help people
+- [ ] Submit CFP to DevOpsDays Portland
+- [ ] Submit CFP to KubeCon (topic: "Zero-to-deploy local K8s CI/CD in 5 minutes")
+- [ ] Present at a CNCF community group virtual meetup
+- [ ] Submit to SeaGL (Seattle GNU/Linux Conference)
+
+### Lower the barrier to zero
+
+- [ ] Homebrew formula: `brew install kindling`
+- [ ] One-liner install script: `curl -sL https://kindling.dev/install | sh`
+- [ ] Ensure the quickstart is completable in under 3 minutes — time it, put the
+  time in the README
+- [ ] Add a hosted demo or screen-recording GIF to the README so people can see
+  it before committing to install
+
+### Education angle
+
+- [ ] Reach out to Southern Oregon University and Rogue Community College about
+  using kindling in K8s / DevOps coursework
+- [ ] Contact bootcamps (online and local) about adopting kindling for labs
+- [ ] Create a "kindling 101" curriculum / workshop materials that instructors
+  can pick up and run with
+- [ ] Pitch to KubeAcademy / Linux Foundation training as a practical lab tool
+
+### Strategic integrations
+
+- [ ] VS Code extension wrapping the CLI (status panel, deploy button, logs view)
+- [ ] Publish `kindling-build` and `kindling-deploy` on the GitHub Marketplace
+- [ ] Ship a devcontainer config so people can try kindling in Gitpod / Codespaces
+  with zero local setup
+
+### More example apps
+
+- [ ] Rails example app (Ruby ecosystem)
+- [ ] Django example app (Python ecosystem)
+- [ ] Spring Boot example app (Java ecosystem)
+- [ ] Each example gives a different community a reason to discover kindling
+
+### Contributor experience
+
+- [ ] Add `good-first-issue` labels on GitHub for approachable tasks
+- [ ] `CONTRIBUTING.md` with dev setup, test instructions, PR expectations, DCO signoff
+- [ ] Shout out contributors in release notes
+
+---
+
 ## OSS infrastructure (deprioritized)
 
 Low priority — do when there's actual community interest:
 
-- `CONTRIBUTING.md` with dev setup, test instructions, PR expectations, DCO signoff
 - `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1)
 - Issue & PR templates (`.github/ISSUE_TEMPLATE/`, PR template)
 - Dynamic README badges (CI status, release, Go Report Card, coverage)
-- Homebrew tap (`brews:` section in `.goreleaser.yml`)
 - MkDocs Material docs site + GitHub Pages deploy workflow
