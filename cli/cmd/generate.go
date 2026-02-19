@@ -312,6 +312,50 @@ var scanSourceExts = map[string]bool{
 	".svelte": true, // Svelte
 }
 
+// envVarAccessPatterns are code-level patterns that indicate a file reads
+// configuration from environment variables. Files containing these patterns
+// are boosted in source-file prioritization so the LLM sees how the app is
+// configured (ports, env var names, health paths, etc.).
+var envVarAccessPatterns = []string{
+	// Go
+	"os.Getenv", "os.LookupEnv",
+	// Node.js / Deno / Bun
+	"process.env.", "process.env[", "Deno.env.get", "Bun.env.",
+	// Python
+	"os.environ", "os.getenv",
+	// Java / Kotlin
+	"System.getenv",
+	// C# / .NET
+	"Environment.GetEnvironmentVariable",
+	// Rust
+	"env::var", "std::env",
+	// Ruby
+	"ENV[", "ENV.fetch",
+	// PHP
+	"getenv(", "$_ENV[", "$_SERVER[",
+	// Elixir
+	"System.get_env", "Application.get_env",
+	// C / C++
+	"std::getenv",
+}
+
+// hasEnvVarPatterns does a quick scan of a source file and returns true if it
+// contains any env-var-access pattern. This is used to boost config-bearing
+// files into the sample window sent to the LLM.
+func hasEnvVarPatterns(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	for _, p := range envVarAccessPatterns {
+		if strings.Contains(content, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func scanRepo(repoPath string) (*repoContext, error) {
 	ctx := &repoContext{
 		name:           filepath.Base(repoPath),
@@ -401,8 +445,17 @@ func scanRepo(repoPath string) (*repoContext, error) {
 	}
 	ctx.tree = sb.String()
 
+	// Pre-scan source files for env var access patterns so config-bearing
+	// files get boosted into the sample window.
+	envVarFiles := make(map[string]bool)
+	for _, path := range sourceFiles {
+		if hasEnvVarPatterns(path) {
+			envVarFiles[path] = true
+		}
+	}
+
 	// Sample entry-point source files (up to 6)
-	mainFiles := prioritizeSourceFiles(sourceFiles)
+	mainFiles := prioritizeSourceFiles(sourceFiles, envVarFiles)
 	for i, path := range mainFiles {
 		if i >= 6 {
 			break
@@ -441,7 +494,10 @@ func readFileCapped(path string, maxLines int) (string, error) {
 
 // prioritizeSourceFiles sorts files so entry-point files (main.go, app.py, etc.)
 // appear first, since they usually reveal ports, routes, and dependencies.
-func prioritizeSourceFiles(files []string) []string {
+// Files in envVarFiles are boosted to tier 1 even if their filename isn't a
+// known entry point, because they contain env-var-access patterns that reveal
+// how the app is configured.
+func prioritizeSourceFiles(files []string, envVarFiles map[string]bool) []string {
 	priority := map[string]int{
 		// Tier 1: primary entry points
 		"main.go": 1, "main.py": 1, "app.py": 1, "app.js": 1, "app.ts": 1,
@@ -471,6 +527,16 @@ func prioritizeSourceFiles(files []string) []string {
 	sort.Slice(files, func(i, j int) bool {
 		pi := priority[filepath.Base(files[i])]
 		pj := priority[filepath.Base(files[j])]
+
+		// Boost files containing env var patterns to tier 1 (entry-point
+		// level) so config files make the cut even with generic names.
+		if pi == 0 && envVarFiles[files[i]] {
+			pi = 1
+		}
+		if pj == 0 && envVarFiles[files[j]] {
+			pj = 1
+		}
+
 		if pi != pj {
 			if pi == 0 {
 				return false
