@@ -7,8 +7,10 @@
 name: Fuzz Test – kindling generate
 
 on:
-  schedule:
-    - cron: "30 20 * * *"  # TEMP: one-shot test, revert to 0 8 */2 * *
+  # schedule:
+  #   - cron: "30 20 * * *"  # TEMP: one-shot test, revert to 0 8 */2 * *
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       repos_override:
