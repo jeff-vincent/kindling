@@ -7,3 +7,4 @@ cover.out
 .vscode/
 *.swp
 .kindling/
+test/fuzz/__pycache__/

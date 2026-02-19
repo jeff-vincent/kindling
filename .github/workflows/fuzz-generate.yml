@@ -1,0 +1,202 @@
+# ─────────────────────────────────────────────────────────────────
+# fuzz-generate.yml — Weekly fuzz-test kindling generate against
+# real-world repos to surface workflow generation issues,
+# especially cross-service networking mismatches.
+# ─────────────────────────────────────────────────────────────────
+name: Fuzz Test – kindling generate
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Every Monday at 6 AM UTC
+  workflow_dispatch:
+    inputs:
+      repos_override:
+        description: "Comma-separated repo URLs (leave blank to use repos.txt)"
+        required: false
+        type: string
+      provider:
+        description: "LLM provider (openai or anthropic)"
+        required: false
+        default: "openai"
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GO_VERSION: "1.23"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout kindling
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build kindling CLI
+        run: |
+          cd cli
+          go build -ldflags "-s -w" -o ../bin/kindling .
+          echo "${{ github.workspace }}/bin" >> "$GITHUB_PATH"
+
+      - name: Verify kindling
+        run: kindling version
+
+      - name: Set up Python (for analyze.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Prepare repo list
+        id: repos
+        run: |
+          if [ -n "${{ inputs.repos_override }}" ]; then
+            echo "${{ inputs.repos_override }}" | tr ',' '\n' > /tmp/repos.txt
+          else
+            cp test/fuzz/repos.txt /tmp/repos.txt
+          fi
+          echo "count=$(grep -v '^\s*#' /tmp/repos.txt | grep -v '^\s*$' | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Run fuzz harness
+        env:
+          FUZZ_PROVIDER: ${{ inputs.provider || 'openai' }}
+          FUZZ_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FUZZ_MODEL: ""
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          chmod +x test/fuzz/run.sh
+          test/fuzz/run.sh /tmp/repos.txt /tmp/fuzz-results bin/kindling
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-results-${{ github.run_number }}
+          path: /tmp/fuzz-results/
+          retention-days: 30
+
+      - name: Generate issue body
+        if: always()
+        id: issue
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, datetime
+
+          output_dir = "/tmp/fuzz-results"
+          summary_file = os.path.join(output_dir, "summary.json")
+          results_file = os.path.join(output_dir, "results.jsonl")
+
+          # Load summary
+          summary = {}
+          if os.path.exists(summary_file):
+              with open(summary_file) as f:
+                  summary = json.load(f)
+
+          # Load per-repo results
+          results = []
+          if os.path.exists(results_file):
+              with open(results_file) as f:
+                  for line in f:
+                      line = line.strip()
+                      if line:
+                          try:
+                              results.append(json.loads(line))
+                          except json.JSONDecodeError:
+                              pass
+
+          # Build markdown
+          today = datetime.date.today().isoformat()
+          md = []
+          md.append(f"## 🔬 Fuzz Test Results — {today}\n")
+          md.append(f"**Run:** [#{os.environ.get('GITHUB_RUN_NUMBER', '?')}]"
+                    f"({os.environ.get('GITHUB_SERVER_URL', '')}/{os.environ.get('GITHUB_REPOSITORY', '')}"
+                    f"/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')})\n")
+
+          md.append("### Summary\n")
+          md.append(f"| Metric | Count |")
+          md.append(f"|--------|-------|")
+          md.append(f"| Repos tested | {summary.get('total', '?')} |")
+          md.append(f"| Generate OK | {summary.get('generate_ok', '?')} ({summary.get('generate_rate', '?')}) |")
+          md.append(f"| Valid YAML | {summary.get('yaml_ok', '?')} |")
+          md.append(f"| Networking clean | {summary.get('network_ok', '?')} ({summary.get('network_rate', '?')}) |")
+          md.append(f"| Docker build OK | {summary.get('build_ok', '?')} |")
+          md.append(f"| Health check OK | {summary.get('health_ok', '?')} |")
+          md.append("")
+
+          # Group results by repo
+          by_repo = {}
+          for r in results:
+              repo = r.get("repo", "unknown")
+              if repo not in by_repo:
+                  by_repo[repo] = []
+              by_repo[repo].append(r)
+
+          # Networking issues section
+          net_issues = [r for r in results
+                        if r.get("stage") == "network_validate"
+                        and r.get("issues") and r.get("issues") != "[]"
+                        and isinstance(r.get("issues"), list) and len(r["issues"]) > 0]
+
+          if net_issues:
+              md.append("### ⚠️ Networking Issues\n")
+              for r in net_issues:
+                  repo_short = r["repo"].split("/")[-1]
+                  md.append(f"<details><summary><b>{repo_short}</b> — {len(r['issues'])} issues</summary>\n")
+                  for issue in r["issues"]:
+                      icon = "🔴" if issue.get("severity") == "error" else "🟡"
+                      md.append(f"- {icon} **{issue.get('type', '?')}** ({issue.get('service', '?')}): "
+                                f"{issue.get('detail', '')}")
+                  md.append(f"\n</details>\n")
+
+          # Failures section
+          failures = [r for r in results if r.get("status") == "fail"]
+          if failures:
+              md.append("### ❌ Failures\n")
+              for r in failures:
+                  repo_short = r["repo"].split("/")[-1]
+                  md.append(f"- **{repo_short}** → `{r.get('stage', '?')}`: {r.get('detail', '')[:150]}")
+              md.append("")
+
+          body = "\n".join(md)
+
+          # Write to file for the issue action
+          with open("/tmp/issue-body.md", "w") as f:
+              f.write(body)
+
+          # Determine title
+          total = summary.get("total", 0)
+          net_ok = summary.get("network_ok", 0)
+          title = f"Fuzz results {today}: {net_ok}/{total} repos networking clean"
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"title={title}\n")
+          PYEOF
+
+      - name: Create or update issue
+        if: always()
+        uses: peter-evans/create-or-update-comment@v4
+        continue-on-error: true
+        with:
+          issue-number: ${{ vars.FUZZ_ISSUE_NUMBER || '' }}
+          body-path: /tmp/issue-body.md
+
+      - name: Create new issue (if no pinned issue)
+        if: always() && !vars.FUZZ_ISSUE_NUMBER
+        uses: peter-evans/create-issue-from-file@v5
+        continue-on-error: true
+        with:
+          title: ${{ steps.issue.outputs.title }}
+          content-filepath: /tmp/issue-body.md
+          labels: |
+            fuzz-test
+            automated

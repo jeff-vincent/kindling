@@ -362,6 +362,79 @@ aren't locked into a single vendor.
 
 ---
 
+## Wild-repo fuzz testing (`kindling generate` hardening)
+
+Clone a large corpus of real-world repos, run `kindling generate` against each
+one, and record structured results to surface failure modes and harden the CLI
+for repos we've never seen.
+
+### Approach
+
+Use a tool like OpenClaw (or a simple GitHub API script) to clone diverse repos
+in bulk, then run the CLI against each one in a sandboxed loop.
+
+### Per-repo result record
+
+Capture a structured JSON/CSV row for every repo:
+
+| Field | Description |
+|---|---|
+| `repo` | GitHub URL |
+| `language` | Primary language (from GitHub API) |
+| `size_kb` | Repo size |
+| `has_dockerfile` | Whether a Dockerfile exists |
+| `has_compose` | Whether docker-compose.yml exists |
+| `services_detected` | Number of services `generate` found |
+| `exit_code` | `kindling generate` exit code |
+| `stderr` | Captured stderr (truncated) |
+| `dse_valid` | Whether a valid `dev-environment.yaml` was produced |
+| `workflow_valid` | Whether the generated workflow YAML parses |
+| `docker_build_ok` | Whether `docker build` succeeds on discovered Dockerfiles |
+| `duration_ms` | Time taken |
+| `failure_category` | Classified reason: `no_dockerfile`, `no_entrypoint`, `env_parse_error`, `unsupported_lang`, `crash`, `timeout`, etc. |
+
+### Repo selection strategy
+
+Random repos are heavily skewed toward toy/single-file projects. Prioritize:
+
+- [ ] GitHub trending repos across top 10–15 languages
+- [ ] Repos that have a `Dockerfile` (already containerized — most relevant)
+- [ ] Repos that have a `docker-compose.yml` (multi-service, already wired)
+- [ ] Long-tail languages/frameworks kindling should handle gracefully (even if
+  it can't fully generate, it should never crash)
+- [ ] Monorepos with multiple services in subdirectories
+
+### Failure taxonomy
+
+Group failures by root cause to prioritize fixes:
+
+- **Crash** — CLI panics or exits non-zero unexpectedly
+- **Bad output** — exits 0 but produces invalid YAML or nonsensical config
+- **Partial success** — finds some services but misses others, or detects wrong
+  ports/health paths
+- **Graceful skip** — correctly identifies it can't generate for this repo and
+  tells the user why (this is the *desired* failure mode)
+
+### Automation
+
+- [ ] Script to clone N repos from a curated list, run `kindling generate`
+  against each, and write results to `results.jsonl`
+- [ ] Summary report: pass rate by language, most common failure categories,
+  top 10 fixable issues
+- [ ] Run periodically (weekly cron or on-demand) to catch regressions as
+  `generate` evolves
+- [ ] Store results in a repo or gist for tracking progress over time
+
+### Goals
+
+- Surface the top 10 failure modes and fix them
+- Get `kindling generate` to a ≥80% success rate on repos that already have a
+  Dockerfile
+- Ensure 0% crash rate — every failure should be a clean error message, never
+  a panic or stack trace
+
+---
+
 ## Adoption & community growth
 
 ### Content & SEO
