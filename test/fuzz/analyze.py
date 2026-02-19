@@ -389,9 +389,14 @@ def main():
         "issues": issues,
     }
 
-    # Always output analysis JSON to stdout (unless --emit-dse uses stdout)
-    if args.emit_dse and args.emit_dse != "-":
+    # Always output analysis JSON to stdout
+    # (When --emit-dse uses stdout, analysis goes to stderr instead)
+    if args.emit_dse and args.emit_dse == "-":
+        json.dump(result, sys.stderr, indent=2)
+        print(file=sys.stderr)  # trailing newline
+    else:
         json.dump(result, sys.stdout, indent=2)
+        print()  # trailing newline
 
     # Emit DSE manifests if requested
     if args.emit_dse:
@@ -400,14 +405,10 @@ def main():
         )
         dse_yaml = emit_dse_yaml(manifests)
         if args.emit_dse == "-":
-            # Put analysis on stderr, DSE on stdout
-            json.dump(result, sys.stderr, indent=2)
             print(dse_yaml)
         else:
             with open(args.emit_dse, "w") as f:
                 f.write(dse_yaml)
-    else:
-        json.dump(result, sys.stdout, indent=2)
 
 
 if __name__ == "__main__":

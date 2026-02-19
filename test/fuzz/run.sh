@@ -35,6 +35,8 @@
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 REPOS_FILE="${1:?Usage: run.sh <repos.txt> <output-dir> [kindling-binary]}"
 OUTPUT_DIR="${2:?Usage: run.sh <repos.txt> <output-dir> [kindling-binary]}"
 KINDLING="${3:-kindling}"
@@ -57,12 +59,25 @@ BUILD_OK=0; DEPLOY_OK=0; E2E_OK=0
 log()  { echo "[$1] $2" >&2; }
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
-# Write a JSON result line
+# Write a JSON result line (uses python3 for proper escaping)
 emit() {
   local repo="$1" stage="$2" status="$3" detail="$4" duration_ms="$5"
-  local services_count="${6:-0}" issues="${7:-[]}"
-  printf '{"repo":"%s","stage":"%s","status":"%s","detail":"%s","duration_ms":%s,"services_count":%s,"issues":%s}\n' \
-    "$repo" "$stage" "$status" "$detail" "$duration_ms" "$services_count" "$issues" \
+  local services_count="${6:-0}" issues="${7:-[]}" category="${8:-}"
+  python3 -c "
+import json, sys
+obj = {
+    'repo': sys.argv[1],
+    'stage': sys.argv[2],
+    'status': sys.argv[3],
+    'detail': sys.argv[4],
+    'duration_ms': int(sys.argv[5]),
+    'services_count': int(sys.argv[6]),
+    'issues': json.loads(sys.argv[7]),
+}
+if sys.argv[8]:
+    obj['category'] = sys.argv[8]
+print(json.dumps(obj))
+" "$repo" "$stage" "$status" "$detail" "$duration_ms" "$services_count" "$issues" "$category" \
     >> "$RESULTS"
 }
 
@@ -98,7 +113,7 @@ test_repo() {
   local gen_stderr="$repo_log.generate.stderr"
 
   if "$KINDLING" generate \
-      --repo "$clone_dir" \
+      --repo-path "$clone_dir" \
       --dry-run \
       --provider "${FUZZ_PROVIDER:-openai}" \
       --api-key "${FUZZ_API_KEY:-$OPENAI_API_KEY}" \
@@ -310,9 +325,12 @@ for b in d.get('builds', []):
   fi
 
   # ── 8. e2e networking validation ─────────────────────────────
-  #     For each service: exec into its pod and:
-  #       a) curl its own health check (sanity)
-  #       b) curl every URL in its env vars (the real test)
+  #     For each service, port-forward from the host and curl:
+  #       a) its own health check (sanity)
+  #       b) every cross-service URL (the real test — via the
+  #          service's ClusterIP, reached from a helper pod)
+  #     We port-forward to avoid depending on wget/curl in the
+  #     container (distroless, scratch, alpine-minimal, etc.)
   t0=$(now_ms)
   local e2e_pass=0 e2e_fail=0 e2e_issues="["
 
@@ -361,24 +379,32 @@ else:
     print('/')
 " 2>/dev/null || echo "/")
 
-    # a) Self health check: curl from inside the pod
+    # a) Self health check via port-forward
     log "E2E" "$dse_name → self :${svc_port}${svc_health}"
-    local self_result
-    self_result=$(kubectl exec "$pod" -n "$NAMESPACE" -- \
-      sh -c "wget -q -O /dev/null -T 5 http://localhost:${svc_port}${svc_health} 2>&1 && echo OK || echo FAIL" \
-      2>/dev/null) || self_result="EXEC_FAIL"
+    local local_port self_result
+    local_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
 
-    if echo "$self_result" | grep -q "OK"; then
+    kubectl port-forward "pod/$pod" -n "$NAMESPACE" \
+      "${local_port}:${svc_port}" >/dev/null 2>&1 &
+    local pf_pid=$!
+    sleep 1  # give port-forward time to bind
+
+    self_result=$(curl -sf -o /dev/null -w "%{http_code}" \
+      --max-time 5 "http://localhost:${local_port}${svc_health}" 2>/dev/null) || self_result="FAIL"
+    kill "$pf_pid" 2>/dev/null; wait "$pf_pid" 2>/dev/null || true
+
+    if [[ "$self_result" =~ ^[23] ]]; then
       e2e_pass=$((e2e_pass + 1))
-      log "PASS" "e2e $dse_name → self health OK"
+      log "PASS" "e2e $dse_name → self health OK ($self_result)"
     else
       e2e_fail=$((e2e_fail + 1))
       [ "$e2e_issues" != "[" ] && e2e_issues="$e2e_issues,"
-      e2e_issues="$e2e_issues{\"service\":\"$dse_name\",\"type\":\"self_health\",\"detail\":\"${svc_health} failed: $self_result\"}"
+      e2e_issues="$e2e_issues{\"service\":\"$dse_name\",\"type\":\"self_health\",\"detail\":\"health check returned $self_result\"}"
       log "FAIL" "e2e $dse_name → self health FAIL ($self_result)"
     fi
 
-    # b) Cross-service: curl every URL-like env var
+    # b) Cross-service: test every URL-like env var via port-forward
+    #    to the target service's ClusterIP
     svc_envs=$(echo "$analysis" | python3 -c "
 import sys, json, re
 d = json.load(sys.stdin)
@@ -400,15 +426,16 @@ for svc in d.get('services', []):
       local env_name="${env_line%%=*}"
       local env_url="${env_line#*=}"
 
-      # Append health check path of the target service if URL has no path
-      local url_to_test="$env_url"
-      # If the URL is just http://host:port with no path, try the target's health path
-      if echo "$url_to_test" | grep -qE '^https?://[^/]+$'; then
-        # Extract target service name from URL
-        local target_name
-        target_name=$(echo "$url_to_test" | sed -E 's|https?://||; s|:[0-9]+.*||')
-        local target_health
-        target_health=$(echo "$analysis" | python3 -c "
+      # Extract target service name and port from URL
+      local target_name target_port url_path
+      target_name=$(echo "$env_url" | sed -E 's|https?://||; s|:[0-9]+.*||')
+      target_port=$(echo "$env_url" | sed -nE 's|.*:([0-9]+).*|\1|p')
+      url_path=$(echo "$env_url" | sed -nE 's|https?://[^/]+(/.*)|\1|p')
+      [ -z "$target_port" ] && target_port="80"
+
+      # If no path, try the target service's health path
+      if [ -z "$url_path" ]; then
+        url_path=$(echo "$analysis" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 t = '$target_name'
@@ -419,22 +446,39 @@ for svc in d.get('services', []):
 else:
     print('/')
 " 2>/dev/null || echo "/")
-        url_to_test="${url_to_test}${target_health}"
       fi
 
-      log "E2E" "$dse_name → $env_name=$url_to_test"
-      local cross_result
-      cross_result=$(kubectl exec "$pod" -n "$NAMESPACE" -- \
-        sh -c "wget -q -O /dev/null -T 5 '$url_to_test' 2>&1 && echo OK || echo FAIL" \
-        2>/dev/null) || cross_result="EXEC_FAIL"
+      # Find the target pod and port-forward to it
+      local target_pod
+      target_pod=$(kubectl get pods -n "$NAMESPACE" -l "app=$target_name" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
 
-      if echo "$cross_result" | grep -q "OK"; then
+      if [ -z "$target_pod" ]; then
+        log "SKIP" "e2e $dse_name → $env_name — target pod '$target_name' not found"
+        continue
+      fi
+
+      log "E2E" "$dse_name → $env_name=$target_name:${target_port}${url_path}"
+
+      local cross_local_port cross_result
+      cross_local_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+
+      kubectl port-forward "pod/$target_pod" -n "$NAMESPACE" \
+        "${cross_local_port}:${target_port}" >/dev/null 2>&1 &
+      local cross_pf_pid=$!
+      sleep 1
+
+      cross_result=$(curl -sf -o /dev/null -w "%{http_code}" \
+        --max-time 5 "http://localhost:${cross_local_port}${url_path}" 2>/dev/null) || cross_result="FAIL"
+      kill "$cross_pf_pid" 2>/dev/null; wait "$cross_pf_pid" 2>/dev/null || true
+
+      if [[ "$cross_result" =~ ^[23] ]]; then
         e2e_pass=$((e2e_pass + 1))
-        log "PASS" "e2e $dse_name → $env_name OK"
+        log "PASS" "e2e $dse_name → $env_name OK ($cross_result)"
       else
         e2e_fail=$((e2e_fail + 1))
         [ "$e2e_issues" != "[" ] && e2e_issues="$e2e_issues,"
-        e2e_issues="$e2e_issues{\"service\":\"$dse_name\",\"type\":\"cross_service\",\"env\":\"$env_name\",\"url\":\"$url_to_test\",\"detail\":\"$cross_result\"}"
+        e2e_issues="$e2e_issues{\"service\":\"$dse_name\",\"type\":\"cross_service\",\"env\":\"$env_name\",\"url\":\"${target_name}:${target_port}${url_path}\",\"detail\":\"returned $cross_result\"}"
         log "FAIL" "e2e $dse_name → $env_name FAIL ($cross_result)"
       fi
     done <<< "$svc_envs"
@@ -475,8 +519,6 @@ cleanup_dse() {
 }
 
 # ── Main ─────────────────────────────────────────────────────────
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 log "START" "Fuzz testing kindling generate (full e2e)"
 log "INFO" "Repos: $REPOS_FILE"
@@ -531,8 +573,8 @@ cat > "$OUTPUT_DIR/summary.json" <<EOF
   "build_ok": $BUILD_OK,
   "deploy_ok": $DEPLOY_OK,
   "e2e_ok": $E2E_OK,
-  "generate_rate": "$([ "$TOTAL" -gt 0 ] && echo "scale=1; $GENERATE_OK * 100 / $TOTAL" | bc 2>/dev/null || echo "?")%",
-  "e2e_rate": "$([ "$DEPLOY_OK" -gt 0 ] && echo "scale=1; $E2E_OK * 100 / $DEPLOY_OK" | bc 2>/dev/null || echo "?")%"
+  "generate_rate": "$(python3 -c "print(f'{$GENERATE_OK/$TOTAL*100:.1f}' if $TOTAL > 0 else '?')")%",
+  "e2e_rate": "$(python3 -c "print(f'{$E2E_OK/$DEPLOY_OK*100:.1f}' if $DEPLOY_OK > 0 else '?')")%"
 }
 EOF
 
