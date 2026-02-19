@@ -152,7 +152,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-results-${{ github.run_number }}
-          path: /tmp/fuzz-results/
+          path: |
+            /tmp/fuzz-results/
+            !/tmp/fuzz-results/repos/
           retention-days: 30
 
       - name: Generate issue body

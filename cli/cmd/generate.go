@@ -98,13 +98,13 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	if repoCtx.needsPublicExpose {
-		fmt.Println()
+		fmt.Fprintln(os.Stderr)
 		step("🔐", fmt.Sprintf("Detected %s%d OAuth/OIDC indicator(s)%s in source code:",
 			colorBold, len(repoCtx.oauthHints), colorReset))
 		for _, hint := range repoCtx.oauthHints {
-			fmt.Printf("       • %s\n", hint)
+			fmt.Fprintf(os.Stderr, "       • %s\n", hint)
 		}
-		fmt.Println()
+		fmt.Fprintln(os.Stderr)
 		step("💡", fmt.Sprintf("Run %skindling expose%s to create a public HTTPS tunnel for OAuth callbacks",
 			colorCyan, colorReset))
 	}
@@ -126,7 +126,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	if genDryRun {
 		header("Generated workflow (dry-run)")
-		fmt.Println()
+		fmt.Fprintln(os.Stderr)
 		fmt.Println(workflow)
 		return nil
 	}

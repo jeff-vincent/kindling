@@ -105,6 +105,7 @@ test_repo() {
     local dur=$(( $(now_ms) - t0 ))
     emit "$repo_url" "clone" "fail" "git clone failed" "$dur"
     log "FAIL" "clone failed — skipping"
+    rm -rf "$clone_dir"
     return
   fi
 
@@ -129,6 +130,7 @@ test_repo() {
     err=$(head -5 "$gen_stderr" | tr '\n' ' ' | cut -c1-200)
     emit "$repo_url" "generate" "fail" "$err" "$dur"
     log "FAIL" "generate — $err"
+    rm -rf "$clone_dir"
     return
   fi
 
@@ -146,6 +148,7 @@ if 'jobs' not in data:
     local dur=$(( $(now_ms) - t0 ))
     emit "$repo_url" "yaml_validate" "fail" "invalid YAML or missing jobs key" "$dur"
     log "FAIL" "invalid YAML"
+    rm -rf "$clone_dir"
     return
   fi
   local dur=$(( $(now_ms) - t0 ))

@@ -24,19 +24,19 @@ const (
 // ── Pretty-print helpers ────────────────────────────────────────
 
 func header(msg string) {
-	fmt.Printf("\n%s%s▸ %s%s\n", colorBold, colorCyan, msg, colorReset)
+	fmt.Fprintf(os.Stderr, "\n%s%s▸ %s%s\n", colorBold, colorCyan, msg, colorReset)
 }
 
 func step(emoji, msg string) {
-	fmt.Printf("  %s  %s\n", emoji, msg)
+	fmt.Fprintf(os.Stderr, "  %s  %s\n", emoji, msg)
 }
 
 func success(msg string) {
-	fmt.Printf("  %s✅ %s%s\n", colorGreen, msg, colorReset)
+	fmt.Fprintf(os.Stderr, "  %s✅ %s%s\n", colorGreen, msg, colorReset)
 }
 
 func warn(msg string) {
-	fmt.Printf("  %s⚠️  %s%s\n", colorYellow, msg, colorReset)
+	fmt.Fprintf(os.Stderr, "  %s⚠️  %s%s\n", colorYellow, msg, colorReset)
 }
 
 func fail(msg string) {
