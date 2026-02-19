@@ -8,7 +8,7 @@ name: Fuzz Test – kindling generate
 
 on:
   schedule:
-    - cron: "0 0 */2 * *"  # Every other day at midnight UTC
+    - cron: "0 8 */2 * *"  # Every other day at 8 AM UTC (midnight PST)
   workflow_dispatch:
     inputs:
       repos_override:
