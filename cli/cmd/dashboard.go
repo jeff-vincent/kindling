@@ -33,7 +33,7 @@ The dashboard runs on http://localhost:9090 by default.`,
 var dashboardPort int
 
 func init() {
-	dashboardCmd.Flags().IntVarP(&dashboardPort, "port", "p", 9090, "Port to serve the dashboard on")
+	dashboardCmd.Flags().IntVar(&dashboardPort, "port", 9090, "Port to serve the dashboard on")
 	rootCmd.AddCommand(dashboardCmd)
 }
 
