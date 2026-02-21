@@ -1,6 +1,289 @@
 # Kindling — Roadmap
 
-## CLI: kindling export (production-ready manifests from cluster state)
+Prioritized for mass adoption. The ordering is: harden what people will
+touch first → remove friction → reach new audiences → deepen the product.
+
+---
+
+## P0 — Remove every barrier to trying kindling
+
+These are the things that stop someone from going from "that looks cool" to
+"I have it running" in under 3 minutes.
+
+### Homebrew formula
+
+`brew install kindling` — single command, no curl gymnastics. This is table
+stakes for any CLI tool targeting macOS developers. File a Homebrew core
+formula PR or host a tap (`kindling-sh/homebrew-tap`).
+
+```bash
+brew tap kindling-sh/tap
+brew install kindling
+```
+
+### One-liner install script
+
+For Linux and CI environments:
+
+```bash
+curl -sL https://kindling.dev/install | sh
+```
+
+Detect OS + arch, download the right binary from GitHub Releases, drop it in
+`/usr/local/bin`. Should also work in Dockerfiles and GitHub Actions runners.
+
+### 3-minute quickstart guarantee
+
+Time the quickstart end-to-end. If it takes longer than 3 minutes, cut steps.
+Put the time in the README: "From zero to a deployed app in under 3 minutes."
+
+- Pre-bake more defaults so fewer flags are required
+- Detect GitHub remote from `.git/config` to skip `--repo` flag
+- Auto-detect GitHub username from `gh auth status` or git config
+
+### README hero demo
+
+Add a screen-recording GIF or hosted demo to the README so people can see
+kindling working before they commit to installing it. First impression matters
+more than anything else on a GitHub repo page.
+
+### Harden `kindling generate` (wild-repo fuzz testing)
+
+`kindling generate` is the first thing a new user will run on their own repo.
+If it crashes, spits out invalid YAML, or silently produces garbage, that's
+the last time they use kindling. This has to be solid *before* Show HN.
+
+Clone a large corpus of real-world repos, run `kindling generate` against each
+one, and record structured results to surface failure modes.
+
+**Per-repo result record:**
+
+| Field | Description |
+|---|---|
+| `repo` | GitHub URL |
+| `language` | Primary language (from GitHub API) |
+| `size_kb` | Repo size |
+| `has_dockerfile` | Whether a Dockerfile exists |
+| `services_detected` | Number of services `generate` found |
+| `exit_code` | `kindling generate` exit code |
+| `dse_valid` | Whether a valid `dev-environment.yaml` was produced |
+| `workflow_valid` | Whether the generated workflow YAML parses |
+| `failure_category` | `no_dockerfile`, `env_parse_error`, `unsupported_lang`, `crash`, `timeout`, etc. |
+
+**Repo selection strategy:**
+- GitHub trending repos across top 10–15 languages
+- Repos with a `Dockerfile` (most relevant)
+- Repos with `docker-compose.yml` (multi-service)
+- Monorepos with multiple services in subdirectories
+- Long-tail languages (should never crash, even if generate can't help)
+
+**Quality gates (must hit before going public):**
+- ≤15% crash rate — every failure is a clean error message, never a panic
+- ≥80% success rate on repos that already have a Dockerfile
+- Top 10 failure modes identified and fixed
+
+### Interactive ingress selection in `kindling generate`
+
+During `kindling generate`, after discovering all services in a multi-service
+repo, prompt the user to select which services should get ingress routes instead
+of trying to auto-detect user-facing services. Present a checklist of discovered
+services and let the developer pick.
+
+For non-interactive / CI usage, add a `--ingress-all` flag that wires up every
+service with a default ingress route.
+
+---
+
+## P1 — Content & visibility (get in front of developers)
+
+The tool can be perfect and nobody will use it if they don't know it exists.
+Content is the growth engine.
+
+### Show HN
+
+Submit a "Show HN" post. Polish the README and demo first. This is a
+one-shot — make it count. Best posted Tuesday–Thursday, 8–10am ET.
+
+### Tutorial: "How to run GitHub Actions locally on Kubernetes"
+
+Targets high-traffic search queries. Naturally leads to kindling as the
+solution. Optimize for SEO — this is the kind of thing people Google when
+they're frustrated with cloud CI wait times.
+
+### Tutorial: "Local Kubernetes CI/CD with Kind"
+
+Similar SEO play, different search intent. Cross-post both tutorials to
+Dev.to, Hashnode, and Medium.
+
+### YouTube walkthrough
+
+Record a video: `git clone` → working deploy in under 5 minutes. Cut
+short-form clips for Twitter/LinkedIn. Developer tools live or die by
+whether people can *see* them working.
+
+### Community presence
+
+- Answer questions on r/kubernetes, r/devops, r/selfhosted — mention
+  kindling when genuinely relevant (not spam, actually help people)
+- Join CNCF Slack and Kubernetes Slack (`#kind`, `#local-dev`) and be useful
+- Submit CFP to DevOpsDays, KubeCon ("Zero-to-deploy local K8s CI/CD in 5
+  minutes"), SeaGL, CNCF community group virtual meetups
+
+---
+
+## P2 — More example apps (every framework = a new audience)
+
+Each example app gives a different language community a reason to discover
+kindling. A Rails developer won't try kindling until they see a Rails example.
+A Spring Boot developer won't try it until they see a Java example.
+
+- [ ] **Rails** example app (Ruby ecosystem — huge community, lots of Docker adoption)
+- [ ] **Django** example app (Python ecosystem — massive, underserved by local K8s tools)
+- [ ] **Spring Boot** example app (Java ecosystem — enterprise developers)
+- [ ] **Next.js** example app (React/Node ecosystem — biggest frontend framework)
+- [ ] **Laravel** example app (PHP ecosystem — still enormous)
+- [ ] **FastAPI** example app (Python — growing fast, modern audience)
+
+Each example should be:
+1. Realistic (not a hello-world — use a database, have a real UI)
+2. Self-contained (copy the directory, push, done)
+3. Documented with its own README
+
+---
+
+## P3 — CLI: kindling diagnose (make Kubernetes less scary)
+
+This is the adoption unlock for developers who aren't Kubernetes experts.
+Most people who try local K8s hit a wall of cryptic errors and give up.
+`kindling diagnose` catches them before they quit.
+
+```
+kindling diagnose
+kindling diagnose --fix
+```
+
+### Error detection
+
+Walk all user-namespace resources and collect:
+
+- **RBAC issues** — pods failing with `Forbidden`, `Unauthorized`; missing
+  RoleBindings, ClusterRoleBindings
+- **Image pull errors** — `ErrImagePull`, `ImagePullBackOff` (wrong tag,
+  missing registry creds, private repo without `imagePullSecrets`)
+- **CrashLoopBackOff** — repeated restarts with exit codes; pull last N log
+  lines for context (extends what `kindling status` already does)
+- **Pending pods** — unschedulable due to resource limits, node affinity,
+  taint/toleration mismatches
+- **Service mismatches** — Service selector doesn't match any pod labels,
+  or targetPort doesn't match container port
+- **Ingress routing gaps** — ingress backend references a Service that
+  doesn't exist or has no ready endpoints
+- **ConfigMap/Secret missing refs** — pod env or volume references a
+  ConfigMap or Secret that doesn't exist
+- **Resource quota / LimitRange violations**
+- **Probe failures** — liveness/readiness probes failing (from pod events)
+
+### Output
+
+Plain-text report grouped by severity:
+
+```
+❌ ERRORS
+  deployment/orders — CrashLoopBackOff (exit 1)
+    last log: "error: DATABASE_URL not set"
+
+  pod/search-abc123 — ImagePullBackOff
+    image: kindling/search-service:latest — not found in local registry
+
+⚠️  WARNINGS
+  service/gateway — targetPort 3000 doesn't match any container port (found: 8080)
+
+  ingress/app — backend "ui-service" has 0 ready endpoints
+```
+
+### LLM integration (`--fix`)
+
+When `--fix` is passed, send the collected errors + relevant resource YAML
+to an LLM and print suggested remediation steps:
+
+- Concrete `kubectl` or `kindling` commands to fix each issue
+- YAML patches for misconfigured resources
+- Explanations of *why* the error occurred (helpful for learning K8s)
+
+Use the same LLM provider already configured for `kindling generate` (OpenAI /
+Anthropic / local). Keep the LLM call optional — `kindling diagnose` without
+`--fix` is fully offline and instant.
+
+### Flags
+
+- `--fix` — pass errors to LLM for remediation suggestions
+- `--namespace` / `-n` — scope to a namespace (default: `default`)
+- `--json` — output as JSON (for CI integration)
+- `--watch` — re-run every N seconds until errors clear
+
+---
+
+## P4 — Strategic integrations (meet developers where they are)
+
+### VS Code extension
+
+Wraps the CLI with a native VS Code experience: status panel, deploy button,
+logs view, tunnel control. VS Code has 70%+ market share — being in the
+marketplace puts kindling in front of every developer browsing for K8s tools.
+
+### Devcontainer config
+
+Ship a `.devcontainer/` config so people can try kindling in Gitpod or
+GitHub Codespaces with zero local setup. Removes Docker/Kind/kubectl as
+prerequisites entirely for the first experience.
+
+### GitHub Marketplace
+
+Publish `kindling-build` and `kindling-deploy` as verified GitHub Marketplace
+actions. Discoverability in the marketplace is free distribution.
+
+---
+
+## P5 — Multi-platform CI support (break vendor lock-in)
+
+Kindling is currently GitHub-only (Actions runners, GitHub PATs, GitHub-specific
+composite actions). Expanding to other platforms unlocks the majority of
+developers who aren't on GitHub Actions.
+
+### Git platforms
+
+- **GitLab** — support GitLab repos, GitLab runner registration, and
+  `.gitlab-ci.yml` generation via `kindling generate`
+- **Bitbucket** — Bitbucket Pipelines runner registration and
+  `bitbucket-pipelines.yml` generation
+- **Gitea / Forgejo** — self-hosted Git; register Gitea Actions runners (Gitea
+  Actions is Act-compatible, so much of the GitHub Actions plumbing carries over)
+
+### CI systems
+
+- **GitLab CI** — generate `.gitlab-ci.yml` with Kaniko build + kubectl deploy
+  stages; register a GitLab Runner in the Kind cluster
+- **CircleCI** — generate `.circleci/config.yml`; self-hosted runner support
+- **Jenkins** — generate `Jenkinsfile`; deploy a Jenkins agent pod in-cluster
+- **Drone / Woodpecker** — lightweight self-hosted CI; generate `.drone.yml` /
+  `.woodpecker.yml`
+
+### Implementation approach
+
+1. Abstract the runner pool CRD — add a `spec.platform` field
+   (`github | gitlab | gitea | ...`) so the operator provisions the correct
+   runner type
+2. `kindling runners --platform gitlab` creates a GitLab Runner registration
+   instead of a GitHub Actions runner
+3. `kindling generate` detects the remote origin to infer the platform, or
+   accepts `--platform` explicitly
+4. Factor composite actions into platform-agnostic build/deploy steps that emit
+   the right CI config format per platform
+5. Keep GitHub as the default — zero breaking changes for existing users
+
+---
+
+## P6 — CLI: kindling export (production-ready manifests)
 
 Generate a Helm chart or Kustomize overlay from the live cluster that gives
 teams a working (or near-working) foundation for deploying to a real environment.
@@ -88,115 +371,26 @@ Generates a `kustomization.yaml` + `base/` resource files:
 
 ---
 
-## CLI: kindling diagnose (error surfacing + LLM remediation)
+## P7 — Expose improvements
 
-Scan the cluster for common errors and misconfigurations, surface them in a
-human-readable report, and optionally pass them to an LLM for suggested next
-steps.
+### Stable callback URL (tunnel URL relay)
 
-```
-kindling diagnose
-kindling diagnose --fix
-```
+Every time `kindling expose` connects, the tunnel gets a new random URL.
+External services that require a callback URL (OAuth, webhooks, Slack) break
+because the registered URL no longer matches.
 
-### Error detection
+Provide a stable intermediate URL that stays the same and automatically
+relays to whatever the current tunnel URL is.
 
-Walk all user-namespace resources and collect:
-
-- **RBAC issues** — pods failing with `Forbidden`, `Unauthorized`; missing
-  RoleBindings, ClusterRoleBindings
-- **Image pull errors** — `ErrImagePull`, `ImagePullBackOff` (wrong tag,
-  missing registry creds, private repo without `imagePullSecrets`)
-- **CrashLoopBackOff** — repeated restarts with exit codes; pull last N log
-  lines for context (extends what `kindling status` already does)
-- **Pending pods** — unschedulable due to resource limits, node affinity,
-  taint/toleration mismatches
-- **Service mismatches** — Service selector doesn't match any pod labels,
-  or targetPort doesn't match container port
-- **Ingress routing gaps** — ingress backend references a Service that
-  doesn't exist or has no ready endpoints
-- **ConfigMap/Secret missing refs** — pod env or volume references a
-  ConfigMap or Secret that doesn't exist
-- **Resource quota / LimitRange violations**
-- **Probe failures** — liveness/readiness probes failing (from pod events)
-
-### Output
-
-Plain-text report grouped by severity:
-
-```
-❌ ERRORS
-  deployment/orders — CrashLoopBackOff (exit 1)
-    last log: "error: DATABASE_URL not set"
-
-  pod/search-abc123 — ImagePullBackOff
-    image: kindling/search-service:latest — not found in local registry
-
-⚠️  WARNINGS
-  service/gateway — targetPort 3000 doesn't match any container port (found: 8080)
-
-  ingress/app — backend "ui-service" has 0 ready endpoints
-```
-
-### LLM integration (`--fix`)
-
-When `--fix` is passed, send the collected errors + relevant resource YAML
-to an LLM and print suggested remediation steps:
-
-- Concrete `kubectl` or `kindling` commands to fix each issue
-- YAML patches for misconfigured resources
-- Explanations of *why* the error occurred (helpful for learning K8s)
-
-Use the same LLM provider already configured for `kindling generate` (OpenAI /
-Anthropic / local). Keep the LLM call optional — `kindling diagnose` without
-`--fix` is fully offline and instant.
-
-### Flags
-
-- `--fix` — pass errors to LLM for remediation suggestions
-- `--namespace` / `-n` — scope to a namespace (default: `default`)
-- `--json` — output as JSON (for CI integration)
-- `--watch` — re-run every N seconds until errors clear
-
----
-
-## Generate: interactive ingress selection
-
-During `kindling generate`, after discovering all services in a multi-service
-repo, prompt the user to select which services should get ingress routes instead
-of trying to auto-detect user-facing services. Present a checklist of discovered
-services and let the developer pick.
-
-For non-interactive / CI usage, add a `--ingress-all` flag that wires up every
-service with a default ingress route.
-
----
-
-## Expose: stable callback URL (tunnel URL relay)
-
-Every time `kindling expose` connects, the tunnel gets a new random URL
-(e.g. `https://abc123.trycloudflare.com`). External services that require a
-callback URL (OAuth providers, payment webhooks, Slack bots, etc.) break
-because the registered URL no longer matches. Updating the callback in every
-external dashboard on each reconnect is a pain.
-
-Provide a stable intermediate URL that stays the same on the developer's
-machine and automatically relays to whatever the current tunnel URL is.
-
-### Approach: lightweight redirect service
+**Approach: lightweight redirect service**
 
 1. On first `kindling expose`, provision a stable hostname — either:
-   - **Self-hosted relay**: a tiny, free-tier-friendly redirect service
-     (Cloudflare Worker, Vercel edge function, or a shared kindling relay
-     at `<username>.relay.kindling.dev`) that stores the current tunnel URL
+   - **Self-hosted relay**: a tiny Cloudflare Worker or Vercel edge function
+     at `<username>.relay.kindling.dev` that stores the current tunnel URL
      and 307-redirects all requests to it
-   - **Local DNS alias**: for simpler setups, a local `/etc/hosts` entry +
-     a small in-cluster nginx that proxies to the tunnel URL — works for
-     services that call back on the local network
-   - **Custom domain with tunnel provider**: if the user has a domain,
-     configure cloudflared named tunnel or ngrok custom domain so the URL
-     is always the same (requires paid tier — document as the "just works"
-     option)
+   - **Custom domain with tunnel provider**: configure cloudflared named
+     tunnel or ngrok custom domain so the URL is always the same (requires
+     paid tier — document as the "just works" option)
 
 2. When `kindling expose` reconnects with a new tunnel URL, it automatically
    pushes the new URL to the relay — the stable hostname never changes
@@ -209,297 +403,56 @@ machine and automatically relays to whatever the current tunnel URL is.
       Stable URL:  https://jeff.relay.kindling.dev  ← use this for callbacks
    ```
 
-### Relay update flow
-
-```
-kindling expose
-  → starts tunnel → gets random URL
-  → PUT https://relay.kindling.dev/api/update { url: "<tunnel-url>" }
-  → relay stores mapping: jeff → <tunnel-url>
-
-External service calls https://jeff.relay.kindling.dev/auth/callback
-  → relay looks up jeff → 307 redirect to https://abc123.trycloudflare.com/auth/callback
-```
-
-### Flags
-
+**Flags:**
 - `--relay` — enable the stable relay URL (first time: provisions hostname)
 - `--relay-domain <host>` — use a custom domain instead of the shared relay
 - `--no-relay` — disable relay, use raw tunnel URL only
 
-### Considerations
-
-- **Security**: relay should verify ownership (simple API key stored in
-  `~/.kindling/relay.yaml`) so nobody can hijack your hostname
-- **Latency**: 307 redirect adds one round-trip; alternatively the relay
-  can reverse-proxy instead of redirect (slightly more infra but invisible
-  to the external service)
-- **POST callbacks**: OAuth and webhooks use POST — 307 preserves method,
-  but some clients don't follow redirects on POST. Reverse-proxy mode
-  avoids this entirely
-- **Free tier sustainability**: a Cloudflare Worker handles this trivially
-  within free tier limits for individual devs
-
----
-
-## Expose: live service switching
-
-Today `kindling expose --service <name>` patches the ingress to route tunnel
-traffic to a specific service, but it only works at tunnel-start time. If the
-tunnel is already running and the developer wants to point it at a different
-service (or the target service wasn't deployed yet when they first ran expose),
-they have to `expose --stop` and re-run.
+### Live service switching
 
 Allow re-targeting the tunnel to a different service while it stays up:
 
 ```
 kindling expose --service orders       # initial — starts tunnel, routes to orders
-kindling expose --service gateway      # re-patch ingress to route to gateway (tunnel stays)
-kindling expose --service ui           # switch again, no restart
+kindling expose --service gateway      # re-patch ingress, tunnel stays
 ```
 
-### Approach
+If a tunnel is already running (pid file exists, process alive), skip starting
+a new tunnel — just re-patch the ingress host/rules.
 
-1. If a tunnel is already running (pid file exists, process alive), skip
-   starting a new tunnel — just re-patch the ingress host/rules to point
-   at the requested service
-2. Save/restore the original ingress state per-service so switching back
-   works cleanly (extend the existing `kindling.dev/original-host` annotation
-   pattern)
-3. Print the current routing clearly:
-   ```
-   🔀  Tunnel traffic now routes to service/gateway (port 8080)
-       https://plans-bios-improvement-atmosphere.trycloudflare.com → gateway
-   ```
+### Ingress path routing (`kindling add view`)
 
-### Flags
-
-- `kindling expose --service <name>` — if tunnel running: re-route; if not: start + route
-- `kindling expose --service` (no arg) — show which service the tunnel currently points to
-
----
-
-## CLI: kindling add view (ingress path routing)
-
-When a tunnel is active (`kindling expose`), the patched ingress typically only
-routes the base path (`/`) to the selected service. If a developer adds a new
-view or API endpoint and pushes, traffic to that path may 404 because the
-ingress has no matching rule for it.
-
-`kindling add view` lets you add path-based routing rules to the active ingress
-without editing YAML or redeploying:
+Add path-based routing rules to the active ingress without editing YAML:
 
 ```
 kindling add view /api --service orders --port 8080
 kindling add view /admin
-kindling add view /docs --service gateway
+kindling add view --list
+kindling add view --remove /api
 ```
 
-### Behavior
-
-1. Finds the ingress currently patched by the tunnel (look for
-   `kindling.dev/original-host` annotation) — or accepts `--ingress <name>`
-   explicitly
-2. Adds a new `paths` entry under the matching host rule with the given path,
-   pathType `Prefix`, and backend service/port
-3. If `--service` and `--port` are omitted, reuses the existing backend from the
-   base `/` rule (most single-service apps only need the path)
-4. If the tunnel is running, the new path is immediately reachable at the public
-   URL (e.g. `https://<tunnel-host>/api`)
-5. Works without a tunnel too — adds the path to any ingress in the namespace
-
-### Flags
-
-- `--service` — backend service name (default: same as existing `/` rule)
-- `--port` — backend service port (default: same as existing `/` rule)
-- `--ingress` — target a specific ingress by name
-- `--namespace` / `-n` — namespace (default: `default`)
-- `--path-type` — `Prefix` (default) or `Exact`
-
-### Related
-
-- `kindling add view --list` — show all paths on the active ingress
-- `kindling add view --remove /api` — remove a previously added path rule
-
 ---
 
-## Multi-platform CI support (break vendor lock-in)
+## P8 — Education angle
 
-Kindling is currently GitHub-only (Actions runners, GitHub PATs, GitHub-specific
-composite actions). Expand to support other Git platforms and CI systems so teams
-aren't locked into a single vendor.
-
-### Git platforms
-
-- **GitLab** — support GitLab repos, GitLab runner registration, and
-  `.gitlab-ci.yml` generation via `kindling generate`
-- **Bitbucket** — Bitbucket Pipelines runner registration and
-  `bitbucket-pipelines.yml` generation
-- **Gitea / Forgejo** — self-hosted Git; register Gitea Actions runners (Gitea
-  Actions is Act-compatible, so much of the GitHub Actions plumbing carries over)
-
-### CI systems
-
-- **GitLab CI** — generate `.gitlab-ci.yml` with Kaniko build + kubectl deploy
-  stages; register a GitLab Runner in the Kind cluster
-- **CircleCI** — generate `.circleci/config.yml`; self-hosted runner support
-- **Jenkins** — generate `Jenkinsfile`; deploy a Jenkins agent pod in-cluster
-- **Drone / Woodpecker** — lightweight self-hosted CI; generate `.drone.yml` /
-  `.woodpecker.yml`
-
-### Implementation approach
-
-1. Abstract the runner pool CRD — add a `spec.platform` field
-   (`github | gitlab | gitea | ...`) so the operator provisions the correct
-   runner type
-2. `kindling runners --platform gitlab` creates a GitLab Runner registration
-   instead of a GitHub Actions runner
-3. `kindling generate` detects the remote origin to infer the platform, or
-   accepts `--platform` explicitly
-4. Factor composite actions into platform-agnostic build/deploy steps that emit
-   the right CI config format per platform
-5. Keep GitHub as the default — zero breaking changes for existing users
-
----
-
-## Wild-repo fuzz testing (`kindling generate` hardening)
-
-Clone a large corpus of real-world repos, run `kindling generate` against each
-one, and record structured results to surface failure modes and harden the CLI
-for repos we've never seen.
-
-### Approach
-
-Use a tool like OpenClaw (or a simple GitHub API script) to clone diverse repos
-in bulk, then run the CLI against each one in a sandboxed loop.
-
-### Per-repo result record
-
-Capture a structured JSON/CSV row for every repo:
-
-| Field | Description |
-|---|---|
-| `repo` | GitHub URL |
-| `language` | Primary language (from GitHub API) |
-| `size_kb` | Repo size |
-| `has_dockerfile` | Whether a Dockerfile exists |
-| `has_compose` | Whether docker-compose.yml exists |
-| `services_detected` | Number of services `generate` found |
-| `exit_code` | `kindling generate` exit code |
-| `stderr` | Captured stderr (truncated) |
-| `dse_valid` | Whether a valid `dev-environment.yaml` was produced |
-| `workflow_valid` | Whether the generated workflow YAML parses |
-| `docker_build_ok` | Whether `docker build` succeeds on discovered Dockerfiles |
-| `duration_ms` | Time taken |
-| `failure_category` | Classified reason: `no_dockerfile`, `no_entrypoint`, `env_parse_error`, `unsupported_lang`, `crash`, `timeout`, etc. |
-
-### Repo selection strategy
-
-Random repos are heavily skewed toward toy/single-file projects. Prioritize:
-
-- [ ] GitHub trending repos across top 10–15 languages
-- [ ] Repos that have a `Dockerfile` (already containerized — most relevant)
-- [ ] Repos that have a `docker-compose.yml` (multi-service, already wired)
-- [ ] Long-tail languages/frameworks kindling should handle gracefully (even if
-  it can't fully generate, it should never crash)
-- [ ] Monorepos with multiple services in subdirectories
-
-### Failure taxonomy
-
-Group failures by root cause to prioritize fixes:
-
-- **Crash** — CLI panics or exits non-zero unexpectedly
-- **Bad output** — exits 0 but produces invalid YAML or nonsensical config
-- **Partial success** — finds some services but misses others, or detects wrong
-  ports/health paths
-- **Graceful skip** — correctly identifies it can't generate for this repo and
-  tells the user why (this is the *desired* failure mode)
-
-### Automation
-
-- [ ] Script to clone N repos from a curated list, run `kindling generate`
-  against each, and write results to `results.jsonl`
-- [ ] Summary report: pass rate by language, most common failure categories,
-  top 10 fixable issues
-- [ ] Run periodically (weekly cron or on-demand) to catch regressions as
-  `generate` evolves
-- [ ] Store results in a repo or gist for tracking progress over time
-
-### Goals
-
-- Surface the top 10 failure modes and fix them
-- Get `kindling generate` to a ≥80% success rate on repos that already have a
-  Dockerfile
-- Ensure 0% crash rate — every failure should be a clean error message, never
-  a panic or stack trace
-
----
-
-## Adoption & community growth
-
-### Content & SEO
-
-- [ ] Write tutorial: "How to run GitHub Actions locally on Kubernetes" (targets
-  high-traffic search queries; naturally leads to kindling as the solution)
-- [ ] Write tutorial: "Local Kubernetes CI/CD with Kind" (similar SEO play)
-- [ ] Cross-post tutorials to Dev.to, Hashnode, and Medium
-- [ ] Record a YouTube walkthrough: `git clone` → working deploy in under 5 minutes
-- [ ] Cut short-form clips from the video for Twitter/LinkedIn
-- [ ] Submit a "Show HN" post (polish README and demo first)
-
-### Community engagement
-
-- [ ] Answer questions on r/kubernetes, r/devops, r/selfhosted — mention kindling
-  when genuinely relevant
-- [ ] Join CNCF Slack and Kubernetes Slack (`#kind`, `#local-dev`) and help people
-- [ ] Submit CFP to DevOpsDays Portland
-- [ ] Submit CFP to KubeCon (topic: "Zero-to-deploy local K8s CI/CD in 5 minutes")
-- [ ] Present at a CNCF community group virtual meetup
-- [ ] Submit to SeaGL (Seattle GNU/Linux Conference)
-
-### Lower the barrier to zero
-
-- [ ] Homebrew formula: `brew install kindling`
-- [ ] One-liner install script: `curl -sL https://kindling.dev/install | sh`
-- [ ] Ensure the quickstart is completable in under 3 minutes — time it, put the
-  time in the README
-- [ ] Add a hosted demo or screen-recording GIF to the README so people can see
-  it before committing to install
-
-### Education angle
-
-- [ ] Reach out to Southern Oregon University and Rogue Community College about
-  using kindling in K8s / DevOps coursework
+- [ ] Reach out to university CS / DevOps programs about using kindling in
+  coursework (Southern Oregon University, Rogue Community College, etc.)
 - [ ] Contact bootcamps (online and local) about adopting kindling for labs
 - [ ] Create a "kindling 101" curriculum / workshop materials that instructors
   can pick up and run with
 - [ ] Pitch to KubeAcademy / Linux Foundation training as a practical lab tool
 
-### Strategic integrations
+---
 
-- [ ] VS Code extension wrapping the CLI (status panel, deploy button, logs view)
-- [ ] Publish `kindling-build` and `kindling-deploy` on the GitHub Marketplace
-- [ ] Ship a devcontainer config so people can try kindling in Gitpod / Codespaces
-  with zero local setup
-
-### More example apps
-
-- [ ] Rails example app (Ruby ecosystem)
-- [ ] Django example app (Python ecosystem)
-- [ ] Spring Boot example app (Java ecosystem)
-- [ ] Each example gives a different community a reason to discover kindling
+## P9 — Contributor experience & OSS infrastructure
 
 ### Contributor experience
 
 - [ ] Add `good-first-issue` labels on GitHub for approachable tasks
-- [ ] `CONTRIBUTING.md` with dev setup, test instructions, PR expectations, DCO signoff
+- [ ] `CONTRIBUTING.md` with dev setup, test instructions, PR expectations
 - [ ] Shout out contributors in release notes
 
----
-
-## OSS infrastructure (deprioritized)
-
-Low priority — do when there's actual community interest:
+### OSS infrastructure (do when there's community interest)
 
 - `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1)
 - Issue & PR templates (`.github/ISSUE_TEMPLATE/`, PR template)
