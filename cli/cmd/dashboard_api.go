@@ -161,6 +161,31 @@ func handleDeployments(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, out)
 }
 
+// ── /api/replicasets ─────────────────────────────────────────────
+
+func handleReplicaSets(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	labelSelector := r.URL.Query().Get("selector")
+	args := []string{"get", "replicasets", "-o", "json"}
+
+	if ns != "" {
+		args = append(args, "-n", ns)
+	} else {
+		args = append(args, "--all-namespaces")
+	}
+	if labelSelector != "" {
+		args = append(args, "-l", labelSelector)
+	}
+
+	out, err := kubectlJSON(args...)
+	if err != nil {
+		jsonError(w, "failed to get replicasets: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, out)
+}
+
 // ── /api/pods ───────────────────────────────────────────────────
 
 func handlePods(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +309,90 @@ func handleNamespaces(w http.ResponseWriter, r *http.Request) {
 	out, err := kubectlJSON("get", "namespaces", "-o", "json")
 	if err != nil {
 		jsonError(w, "failed to get namespaces: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, out)
+}
+
+// ── /api/serviceaccounts ────────────────────────────────────────
+
+func handleServiceAccounts(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	args := []string{"get", "serviceaccounts", "-o", "json"}
+	if ns != "" {
+		args = append(args, "-n", ns)
+	} else {
+		args = append(args, "--all-namespaces")
+	}
+
+	out, err := kubectlJSON(args...)
+	if err != nil {
+		jsonError(w, "failed to get serviceaccounts: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, out)
+}
+
+// ── /api/roles ──────────────────────────────────────────────────
+
+func handleRoles(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	args := []string{"get", "roles", "-o", "json"}
+	if ns != "" {
+		args = append(args, "-n", ns)
+	} else {
+		args = append(args, "--all-namespaces")
+	}
+
+	out, err := kubectlJSON(args...)
+	if err != nil {
+		jsonResponse(w, map[string]interface{}{"items": []interface{}{}})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, out)
+}
+
+// ── /api/rolebindings ───────────────────────────────────────────
+
+func handleRoleBindings(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	args := []string{"get", "rolebindings", "-o", "json"}
+	if ns != "" {
+		args = append(args, "-n", ns)
+	} else {
+		args = append(args, "--all-namespaces")
+	}
+
+	out, err := kubectlJSON(args...)
+	if err != nil {
+		jsonResponse(w, map[string]interface{}{"items": []interface{}{}})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, out)
+}
+
+// ── /api/clusterroles ───────────────────────────────────────────
+
+func handleClusterRoles(w http.ResponseWriter, r *http.Request) {
+	out, err := kubectlJSON("get", "clusterroles", "-o", "json")
+	if err != nil {
+		jsonResponse(w, map[string]interface{}{"items": []interface{}{}})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, out)
+}
+
+// ── /api/clusterrolebindings ────────────────────────────────────
+
+func handleClusterRoleBindings(w http.ResponseWriter, r *http.Request) {
+	out, err := kubectlJSON("get", "clusterrolebindings", "-o", "json")
+	if err != nil {
+		jsonResponse(w, map[string]interface{}{"items": []interface{}{}})
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

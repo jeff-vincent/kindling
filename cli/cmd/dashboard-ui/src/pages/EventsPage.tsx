@@ -1,57 +1,71 @@
 import { useApi } from '../api';
 import type { K8sList, K8sEvent } from '../types';
-import { StatusBadge, TimeAgo, EmptyState } from './shared';
+import { EmptyState, TimeAgo } from './shared';
 
 export function EventsPage() {
-  const { data, loading } = useApi<K8sList<K8sEvent>>('/api/events', 10_000);
+  const { data, loading } = useApi<K8sList<K8sEvent>>('/api/events');
 
   if (loading) return <div className="loading">Loading events…</div>;
 
-  const items = (data?.items || []).sort((a, b) => {
+  const events = (data?.items || []).filter(
+    (e) => e.metadata.namespace !== 'kube-system' && e.metadata.namespace !== 'local-path-storage'
+  );
+
+  // Sort by last timestamp descending
+  events.sort((a, b) => {
     const ta = a.lastTimestamp || a.metadata.creationTimestamp || '';
     const tb = b.lastTimestamp || b.metadata.creationTimestamp || '';
-    return tb.localeCompare(ta); // newest first
+    return tb.localeCompare(ta);
   });
 
   return (
     <div className="page">
-      <h1>Events</h1>
+      <div className="page-header">
+        <div className="page-header-left">
+          <h1>Events</h1>
+          <p className="page-subtitle">Recent cluster events</p>
+        </div>
+      </div>
 
-      {items.length === 0 ? (
-        <EmptyState message="No events found." />
+      {events.length === 0 ? (
+        <EmptyState icon="◈" message="No events in workload namespaces." />
       ) : (
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Type</th>
-              <th>Reason</th>
-              <th>Object</th>
-              <th>Message</th>
-              <th>#</th>
-              <th>Last Seen</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((e, i) => {
-              const ok = e.type === 'Normal';
-              const obj = e.involvedObject
-                ? `${e.involvedObject.kind}/${e.involvedObject.name}`
-                : '—';
-              return (
-                <tr key={`${e.metadata.name}-${i}`}>
-                  <td><StatusBadge ok={ok} label={e.type ?? 'Normal'} /></td>
-                  <td className="mono">{e.reason ?? '—'}</td>
-                  <td className="mono truncate" title={obj}>{obj}</td>
-                  <td className="event-message">{e.message ?? '—'}</td>
-                  <td>{e.count ?? 1}</td>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th style={{ width: 72 }}>Type</th>
+                <th>Reason</th>
+                <th>Object</th>
+                <th>Namespace</th>
+                <th>Message</th>
+                <th style={{ width: 60 }}>Count</th>
+                <th>Last Seen</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.map((ev, i) => (
+                <tr key={`${ev.metadata.namespace}/${ev.metadata.name}-${i}`}>
                   <td>
-                    <TimeAgo timestamp={e.lastTimestamp || e.metadata.creationTimestamp} />
+                    <span className={`event-badge event-${(ev.type || 'Normal').toLowerCase()}`}>
+                      {ev.type || 'Normal'}
+                    </span>
                   </td>
+                  <td className="mono">{ev.reason}</td>
+                  <td className="mono" style={{ fontSize: '0.8em' }}>
+                    {ev.involvedObject?.kind}/{ev.involvedObject?.name}
+                  </td>
+                  <td><span className="tag">{ev.metadata.namespace}</span></td>
+                  <td style={{ maxWidth: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {ev.message}
+                  </td>
+                  <td style={{ textAlign: 'center' }}>{ev.count || 1}</td>
+                  <td><TimeAgo timestamp={ev.lastTimestamp || ev.metadata.creationTimestamp} /></td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

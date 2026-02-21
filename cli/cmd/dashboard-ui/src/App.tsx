@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { ToastProvider } from './pages/actions';
+import { ToastProvider, ActionModal, ConfirmDialog, useToast, ResultOutput } from './pages/actions';
+import { useApi, apiPost, apiDelete, fetchExposeStatus, streamInit } from './api';
+import type { ActionResult } from './api';
 import { OverviewPage } from './pages/OverviewPage';
 import { DSEPage } from './pages/DSEPage';
 import { RunnersPage } from './pages/RunnersPage';
@@ -10,6 +12,8 @@ import { ServicesPage } from './pages/ServicesPage';
 import { IngressesPage } from './pages/IngressesPage';
 import { SecretsPage } from './pages/SecretsPage';
 import { EventsPage } from './pages/EventsPage';
+import { RBACPage } from './pages/RBACPage';
+import type { K8sList, K8sIngress } from './types';
 
 type Page =
   | 'overview'
@@ -20,18 +24,55 @@ type Page =
   | 'services'
   | 'ingresses'
   | 'secrets'
-  | 'events';
+  | 'events'
+  | 'rbac';
 
-const NAV: { page: Page; icon: string; label: string }[] = [
-  { page: 'overview', icon: '📊', label: 'Overview' },
-  { page: 'dses', icon: '🚀', label: 'Environments' },
-  { page: 'runners', icon: '🏃', label: 'Runners' },
-  { page: 'deployments', icon: '📦', label: 'Deployments' },
-  { page: 'pods', icon: '🫛', label: 'Pods' },
-  { page: 'services', icon: '🔌', label: 'Services' },
-  { page: 'ingresses', icon: '🌐', label: 'Ingresses' },
-  { page: 'secrets', icon: '🔑', label: 'Secrets' },
-  { page: 'events', icon: '📋', label: 'Events' },
+interface NavGroup {
+  label: string;
+  items: { page: Page; icon: string; label: string }[];
+}
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: 'Cluster',
+    items: [
+      { page: 'overview', icon: '⬡', label: 'Overview' },
+      { page: 'events', icon: '⚡', label: 'Events' },
+    ],
+  },
+  {
+    label: 'Kindling',
+    items: [
+      { page: 'dses', icon: '◆', label: 'Environments' },
+      { page: 'runners', icon: '▶', label: 'Runners' },
+    ],
+  },
+  {
+    label: 'Workloads',
+    items: [
+      { page: 'deployments', icon: '□', label: 'Deployments' },
+      { page: 'pods', icon: '○', label: 'Pods' },
+    ],
+  },
+  {
+    label: 'Network',
+    items: [
+      { page: 'services', icon: '◎', label: 'Services' },
+      { page: 'ingresses', icon: '⊕', label: 'Ingresses' },
+    ],
+  },
+  {
+    label: 'Configuration',
+    items: [
+      { page: 'secrets', icon: '◈', label: 'Secrets' },
+    ],
+  },
+  {
+    label: 'Access Control',
+    items: [
+      { page: 'rbac', icon: '⊘', label: 'RBAC' },
+    ],
+  },
 ];
 
 const PAGES: Record<Page, () => ReactNode> = {
@@ -44,6 +85,7 @@ const PAGES: Record<Page, () => ReactNode> = {
   ingresses: IngressesPage,
   secrets: SecretsPage,
   events: EventsPage,
+  rbac: RBACPage,
 };
 
 function App() {
@@ -52,33 +94,479 @@ function App() {
 
   return (
     <ToastProvider>
-    <div className="app">
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <span className="brand-icon">🔥</span>
-          <span className="brand-text">kindling</span>
-        </div>
-        <nav className="sidebar-nav">
-          {NAV.map((item) => (
-            <button
-              key={item.page}
-              className={`nav-item ${activePage === item.page ? 'active' : ''}`}
-              onClick={() => setActivePage(item.page)}
-            >
-              <span className="nav-icon">{item.icon}</span>
-              <span className="nav-label">{item.label}</span>
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-footer">
-          <span className="version">kindling dashboard</span>
-        </div>
-      </aside>
-      <main className="main-content">
-        <ActiveComponent />
-      </main>
-    </div>
+      <div className="app">
+        <AppSidebar activePage={activePage} setActivePage={setActivePage} />
+        <main className="main-content">
+          <ActiveComponent />
+        </main>
+      </div>
     </ToastProvider>
+  );
+}
+
+// ── Command Menu (popover from sidebar) ─────────────────────────
+
+function CommandMenu({ onClose, onAction }: {
+  onClose: () => void;
+  onAction: (action: string) => void;
+}) {
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [onClose]);
+
+  return (
+    <>
+      <div className="cmd-menu-backdrop" onClick={onClose} />
+      <div className="cmd-menu">
+        <div className="cmd-menu-header">Commands</div>
+
+        <div className="cmd-menu-group">
+          <div className="cmd-menu-group-label">Lifecycle</div>
+          <button className="cmd-item" onClick={() => onAction('init')}>
+            <span className="cmd-item-icon i-green">⚡</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Init Cluster</div>
+              <div className="cmd-item-desc">Bootstrap Kind + operator</div>
+            </span>
+          </button>
+          <button className="cmd-item" onClick={() => onAction('destroy')}>
+            <span className="cmd-item-icon i-red">✕</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Destroy Cluster</div>
+              <div className="cmd-item-desc">Tear down everything</div>
+            </span>
+          </button>
+        </div>
+
+        <div className="cmd-menu-group">
+          <div className="cmd-menu-group-label">Deploy</div>
+          <button className="cmd-item" onClick={() => onAction('deploy')}>
+            <span className="cmd-item-icon i-blue">▲</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Deploy Environment</div>
+              <div className="cmd-item-desc">Apply a DevStagingEnvironment YAML</div>
+            </span>
+          </button>
+          <button className="cmd-item" onClick={() => onAction('apply')}>
+            <span className="cmd-item-icon i-purple">⎘</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Apply YAML</div>
+              <div className="cmd-item-desc">Run kubectl apply with raw YAML</div>
+            </span>
+          </button>
+        </div>
+
+        <div className="cmd-menu-group">
+          <div className="cmd-menu-group-label">Network</div>
+          <button className="cmd-item" onClick={() => onAction('expose')}>
+            <span className="cmd-item-icon i-cyan">↗</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Expose / Tunnel</div>
+              <div className="cmd-item-desc">Public HTTPS tunnel for OAuth</div>
+            </span>
+          </button>
+        </div>
+
+        <div className="cmd-menu-group">
+          <div className="cmd-menu-group-label">Manage</div>
+          <button className="cmd-item" onClick={() => onAction('secret')}>
+            <span className="cmd-item-icon i-orange">◈</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Create Secret</div>
+              <div className="cmd-item-desc">Store an external secret</div>
+            </span>
+          </button>
+          <button className="cmd-item" onClick={() => onAction('runner')}>
+            <span className="cmd-item-icon i-green">▶</span>
+            <span className="cmd-item-text">
+              <div className="cmd-item-label">Create Runner</div>
+              <div className="cmd-item-desc">Register a GitHub Actions runner</div>
+            </span>
+          </button>
+        </div>
+
+        <div className="cmd-menu-footer">
+          <kbd>esc</kbd> to close
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── Expose Modal (ingress picker) ───────────────────────────────
+
+function ExposeModal({ running, onStart, onStop, onClose }: {
+  running: boolean;
+  onStart: (service?: string) => void;
+  onStop: () => void;
+  onClose: () => void;
+}) {
+  const { data } = useApi<K8sList<K8sIngress>>('/api/ingresses');
+  const [selected, setSelected] = useState('');
+
+  const ingresses = (data?.items || []).filter(
+    (i) => i.metadata.namespace !== 'kube-system' && i.metadata.namespace !== 'ingress-nginx'
+  );
+
+  if (running) {
+    return (
+      <ActionModal title="Stop Tunnel" submitLabel="Stop Tunnel" onSubmit={onStop} onClose={onClose}>
+        <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
+          A tunnel is currently active. Stopping it will restore the original ingress hosts.
+        </p>
+      </ActionModal>
+    );
+  }
+
+  return (
+    <ActionModal
+      title="Expose / Tunnel"
+      submitLabel="Start Tunnel"
+      onSubmit={() => onStart(selected || undefined)}
+      onClose={onClose}
+    >
+      <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 12 }}>
+        Creates a public HTTPS tunnel via Cloudflare and patches the selected ingress host to route through it.
+      </p>
+      <label className="form-label">Target Ingress</label>
+      {ingresses.length === 0 ? (
+        <p style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>
+          No ingresses found — the tunnel will start but no ingress will be patched.
+        </p>
+      ) : (
+        <select
+          className="form-input"
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+        >
+          <option value="">All ingresses (first match)</option>
+          {ingresses.map((ing) => (
+            <option key={`${ing.metadata.namespace}/${ing.metadata.name}`} value={ing.metadata.name}>
+              {ing.metadata.name}
+              {ing.spec.rules?.[0]?.host ? ` (${ing.spec.rules[0].host})` : ''}
+            </option>
+          ))}
+        </select>
+      )}
+    </ActionModal>
+  );
+}
+
+// ── Sidebar ─────────────────────────────────────────────────────
+
+function AppSidebar({ activePage, setActivePage }: { activePage: Page; setActivePage: (p: Page) => void }) {
+  const { toast } = useToast();
+
+  const [cmdOpen, setCmdOpen] = useState(false);
+
+  // ── modal state ───────────────────────────────────
+  const [showDeploy, setShowDeploy] = useState(false);
+  const [showApply, setShowApply] = useState(false);
+  const [showSecret, setShowSecret] = useState(false);
+  const [showRunner, setShowRunner] = useState(false);
+  const [showDestroy, setShowDestroy] = useState(false);
+  const [showExpose, setShowExpose] = useState(false);
+
+  const [deployYaml, setDeployYaml] = useState('');
+  const [applyYaml, setApplyYaml] = useState('');
+  const [deploying, setDeploying] = useState(false);
+  const [applying, setApplying] = useState(false);
+
+  const [secretForm, setSecretForm] = useState({ name: '', namespace: 'default', key: '', value: '' });
+  const [creatingSec, setCreatingSec] = useState(false);
+
+  const [runnerForm, setRunnerForm] = useState({ username: '', repo: '', token: '' });
+  const [creatingRun, setCreatingRun] = useState(false);
+
+  // ── init cluster ──────────────────────────────────
+  const [initRunning, setInitRunning] = useState(false);
+  const [showInit, setShowInit] = useState(false);
+  const [initMessages, setInitMessages] = useState<string[]>([]);
+  const [initResult, setInitResult] = useState<ActionResult | null>(null);
+
+  // ── expose / tunnel ───────────────────────────────
+  const [tunnelStatus, setTunnelStatus] = useState<{ running: boolean; url?: string } | null>(null);
+  useEffect(() => {
+    fetchExposeStatus().then(setTunnelStatus).catch(() => {});
+    const interval = setInterval(() => {
+      fetchExposeStatus().then(setTunnelStatus).catch(() => {});
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ── keyboard shortcut ─────────────────────────────
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setCmdOpen(prev => !prev);
+      }
+    }
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, []);
+
+  function handleAction(action: string) {
+    setCmdOpen(false);
+    switch (action) {
+      case 'init': handleInit(); break;
+      case 'destroy': setShowDestroy(true); break;
+      case 'deploy': setShowDeploy(true); break;
+      case 'apply': setShowApply(true); break;
+      case 'expose': setShowExpose(true); break;
+      case 'secret': setShowSecret(true); break;
+      case 'runner': setShowRunner(true); break;
+    }
+  }
+
+  async function handleDeploy() {
+    setDeploying(true);
+    const result = await apiPost('/api/deploy', { yaml: deployYaml });
+    setDeploying(false);
+    if (result.ok) {
+      toast(result.output || 'Deployed successfully', 'success');
+      setShowDeploy(false);
+      setDeployYaml('');
+    } else {
+      toast(result.error || 'Deploy failed', 'error');
+    }
+  }
+
+  async function handleApply() {
+    setApplying(true);
+    const result = await apiPost('/api/apply', { yaml: applyYaml });
+    setApplying(false);
+    if (result.ok) {
+      toast(result.output || 'Applied successfully', 'success');
+      setShowApply(false);
+      setApplyYaml('');
+    } else {
+      toast(result.error || 'Apply failed', 'error');
+    }
+  }
+
+  async function handleCreateSecret() {
+    setCreatingSec(true);
+    const result = await apiPost('/api/secrets/create', secretForm);
+    setCreatingSec(false);
+    if (result.ok) {
+      toast('Secret created', 'success');
+      setShowSecret(false);
+      setSecretForm({ name: '', namespace: 'default', key: '', value: '' });
+    } else {
+      toast(result.error || 'Failed to create secret', 'error');
+    }
+  }
+
+  async function handleCreateRunner() {
+    setCreatingRun(true);
+    const result = await apiPost('/api/runners/create', runnerForm);
+    setCreatingRun(false);
+    if (result.ok) {
+      toast('Runner pool created', 'success');
+      setShowRunner(false);
+      setRunnerForm({ username: '', repo: '', token: '' });
+    } else {
+      toast(result.error || 'Failed to create runner', 'error');
+    }
+  }
+
+  async function toggleTunnel(service?: string) {
+    if (tunnelStatus?.running) {
+      const result = await apiDelete('/api/expose');
+      if (result.ok) {
+        toast('Tunnel stopped', 'success');
+        setTunnelStatus({ running: false });
+      } else {
+        toast(result.error || 'Failed to stop tunnel', 'error');
+      }
+    } else {
+      const result = await apiPost('/api/expose', service ? { service } : {});
+      if (result.ok) {
+        toast(result.output || 'Tunnel started', 'success');
+        fetchExposeStatus().then(setTunnelStatus);
+      } else {
+        toast(result.error || 'Failed to start tunnel', 'error');
+      }
+    }
+  }
+
+  async function handleInit() {
+    setShowInit(true);
+    setInitRunning(true);
+    setInitMessages([]);
+    setInitResult(null);
+    const result = await streamInit((msg) => setInitMessages((m) => [...m, msg]));
+    setInitResult(result);
+    setInitRunning(false);
+    if (result.ok) toast('Cluster initialized', 'success');
+    else toast(result.error || 'Init failed', 'error');
+  }
+
+  async function handleDestroy() {
+    setShowDestroy(false);
+    const result = await apiDelete('/api/cluster/destroy');
+    if (result.ok) toast('Cluster destroyed', 'success');
+    else toast(result.error || 'Destroy failed', 'error');
+  }
+
+  return (
+    <aside className="sidebar">
+      <div className="sidebar-brand">
+        <span className="brand-icon">🔥</span>
+        <span className="brand-text">kindling</span>
+      </div>
+      <nav className="sidebar-nav">
+        {NAV_GROUPS.map((group) => (
+          <div key={group.label}>
+            <div className="nav-group-label">{group.label}</div>
+            {group.items.map((item) => (
+              <button
+                key={item.page}
+                className={`nav-item ${activePage === item.page ? 'active' : ''}`}
+                onClick={() => setActivePage(item.page)}
+              >
+                <span className="nav-icon">{item.icon}</span>
+                <span className="nav-label">{item.label}</span>
+              </button>
+            ))}
+          </div>
+        ))}
+      </nav>
+
+      {/* ── Command trigger ──────────────── */}
+      <div style={{ padding: '12px 0 0' }}>
+        <button className="cmd-trigger" onClick={() => setCmdOpen(!cmdOpen)}>
+          <span className="cmd-trigger-icon">⌘</span>
+          <span className="cmd-trigger-label">Commands</span>
+          <span className="cmd-trigger-hint">⌘K</span>
+        </button>
+      </div>
+
+      {cmdOpen && (
+        <CommandMenu onClose={() => setCmdOpen(false)} onAction={handleAction} />
+      )}
+
+      <div className="sidebar-footer">
+        {tunnelStatus?.running && tunnelStatus.url && (
+          <div className="tunnel-widget">
+            <div className="tunnel-widget-header">
+              <span className="tunnel-pulse" />
+              <span className="tunnel-widget-label">Tunnel Active</span>
+            </div>
+            <a href={tunnelStatus.url} target="_blank" rel="noopener" className="tunnel-widget-url">
+              {tunnelStatus.url.replace('https://', '')}
+            </a>
+            <button
+              className="tunnel-copy-btn"
+              onClick={() => {
+                navigator.clipboard.writeText(tunnelStatus.url!);
+                toast('URL copied', 'success');
+              }}
+            >
+              Copy URL
+            </button>
+          </div>
+        )}
+        <span className="version">kindling dashboard v0.1</span>
+      </div>
+
+      {/* ── Deploy modal ─────────────────── */}
+      {showExpose && (
+        <ExposeModal
+          running={tunnelStatus?.running ?? false}
+          onStart={(service) => { setShowExpose(false); toggleTunnel(service); }}
+          onStop={() => { setShowExpose(false); toggleTunnel(); }}
+          onClose={() => setShowExpose(false)}
+        />
+      )}
+
+      {/* ── Deploy Environment modal ─────── */}
+      {showDeploy && (
+        <ActionModal title="Deploy Environment" submitLabel="Deploy" loading={deploying} onSubmit={handleDeploy} onClose={() => setShowDeploy(false)}>
+          <label className="form-label">DevStagingEnvironment YAML</label>
+          <textarea className="form-textarea" rows={14} placeholder={"apiVersion: apps.kindling.dev/v1alpha1\nkind: DevStagingEnvironment\nmetadata:\n  name: my-app\nspec:\n  ..."} value={deployYaml} onChange={(e) => setDeployYaml(e.target.value)} />
+        </ActionModal>
+      )}
+
+      {/* ── Apply YAML modal ─────────────── */}
+      {showApply && (
+        <ActionModal title="Apply YAML" submitLabel="Apply" loading={applying} onSubmit={handleApply} onClose={() => setShowApply(false)}>
+          <label className="form-label">Raw YAML to apply via kubectl</label>
+          <textarea className="form-textarea" rows={14} placeholder={"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  ..."} value={applyYaml} onChange={(e) => setApplyYaml(e.target.value)} />
+        </ActionModal>
+      )}
+
+      {/* ── Create Secret modal ──────────── */}
+      {showSecret && (
+        <ActionModal title="Create Secret" submitLabel="Create" loading={creatingSec} onSubmit={handleCreateSecret} onClose={() => setShowSecret(false)}>
+          <label className="form-label">Name</label>
+          <input className="form-input" placeholder="my-secret" value={secretForm.name} onChange={(e) => setSecretForm({ ...secretForm, name: e.target.value })} />
+          <label className="form-label">Namespace</label>
+          <input className="form-input" placeholder="default" value={secretForm.namespace} onChange={(e) => setSecretForm({ ...secretForm, namespace: e.target.value })} />
+          <label className="form-label">Key</label>
+          <input className="form-input" placeholder="SECRET_KEY" value={secretForm.key} onChange={(e) => setSecretForm({ ...secretForm, key: e.target.value })} />
+          <label className="form-label">Value</label>
+          <input className="form-input" type="password" placeholder="secret value" value={secretForm.value} onChange={(e) => setSecretForm({ ...secretForm, value: e.target.value })} />
+        </ActionModal>
+      )}
+
+      {/* ── Create Runner modal ──────────── */}
+      {showRunner && (
+        <ActionModal title="Create Runner Pool" submitLabel="Create" loading={creatingRun} onSubmit={handleCreateRunner} onClose={() => setShowRunner(false)}>
+          <label className="form-label">GitHub Username</label>
+          <input className="form-input" placeholder="your-username" value={runnerForm.username} onChange={(e) => setRunnerForm({ ...runnerForm, username: e.target.value })} />
+          <label className="form-label">Repository (owner/repo)</label>
+          <input className="form-input" placeholder="owner/repo" value={runnerForm.repo} onChange={(e) => setRunnerForm({ ...runnerForm, repo: e.target.value })} />
+          <label className="form-label">GitHub PAT</label>
+          <input className="form-input" type="password" placeholder="ghp_..." value={runnerForm.token} onChange={(e) => setRunnerForm({ ...runnerForm, token: e.target.value })} />
+        </ActionModal>
+      )}
+
+      {/* ── Init progress modal ──────────── */}
+      {showInit && (
+        <div className="modal-overlay" onClick={initRunning ? undefined : () => setShowInit(false)}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Initialize Cluster</h3>
+              {!initRunning && <button className="panel-close" onClick={() => setShowInit(false)}>✕</button>}
+            </div>
+            <div className="modal-body">
+              {initMessages.length > 0 && (
+                <div className="log-viewer" style={{ marginBottom: 12 }}>
+                  <pre className="log-output">{initMessages.map((m, i) => <div key={i}>{m}</div>)}</pre>
+                </div>
+              )}
+              {initRunning && initMessages.length === 0 && (
+                <p style={{ color: 'var(--text-tertiary)' }}>Starting cluster initialization…</p>
+              )}
+              <ResultOutput result={initResult} />
+            </div>
+            {!initRunning && (
+              <div className="modal-footer">
+                <button className="btn" onClick={() => setShowInit(false)}>Close</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Destroy confirm ──────────────── */}
+      {showDestroy && (
+        <ConfirmDialog
+          title="Destroy Cluster"
+          message="This will permanently delete the Kind cluster and all resources. This cannot be undone."
+          confirmLabel="Destroy"
+          danger
+          onConfirm={handleDestroy}
+          onCancel={() => setShowDestroy(false)}
+        />
+      )}
+    </aside>
   );
 }
 

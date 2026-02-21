@@ -49,12 +49,18 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 	mux.HandleFunc("/api/dses", handleDSEs)
 	mux.HandleFunc("/api/runners", handleRunners)
 	mux.HandleFunc("/api/deployments", handleDeployments)
+	mux.HandleFunc("/api/replicasets", handleReplicaSets)
 	mux.HandleFunc("/api/pods", handlePods)
 	mux.HandleFunc("/api/services", handleServices)
 	mux.HandleFunc("/api/ingresses", handleIngresses)
 	mux.HandleFunc("/api/secrets", handleSecrets)
 	mux.HandleFunc("/api/events", handleEvents)
 	mux.HandleFunc("/api/namespaces", handleNamespaces)
+	mux.HandleFunc("/api/serviceaccounts", handleServiceAccounts)
+	mux.HandleFunc("/api/roles", handleRoles)
+	mux.HandleFunc("/api/rolebindings", handleRoleBindings)
+	mux.HandleFunc("/api/clusterroles", handleClusterRoles)
+	mux.HandleFunc("/api/clusterrolebindings", handleClusterRoleBindings)
 	mux.HandleFunc("/api/logs/", handleLogs)
 
 	// ── API routes (actions) ────────────────────────────────────

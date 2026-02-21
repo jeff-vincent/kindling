@@ -56,6 +56,27 @@ export function ConditionsTable({ conditions }: { conditions?: K8sCondition[] })
   );
 }
 
-export function EmptyState({ message }: { message: string }) {
-  return <div className="empty-state">{message}</div>;
+export function EmptyState({ message, icon }: { message: string; icon?: string }) {
+  return (
+    <div className="empty-state">
+      {icon && <div className="empty-icon">{icon}</div>}
+      <p>{message}</p>
+    </div>
+  );
+}
+
+export function LabelBadges({ labels }: { labels?: Record<string, string> }) {
+  if (!labels) return null;
+  const entries = Object.entries(labels).filter(
+    ([k]) => !k.startsWith('controller-uid') && !k.startsWith('pod-template-hash')
+  );
+  if (!entries.length) return null;
+  return (
+    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+      {entries.slice(0, 5).map(([k, v]) => (
+        <span key={k} className="tag">{k.split('/').pop()}={v}</span>
+      ))}
+      {entries.length > 5 && <span className="tag">+{entries.length - 5}</span>}
+    </div>
+  );
 }

@@ -7,6 +7,12 @@ export interface K8sMetadata {
   annotations?: Record<string, string>;
   creationTimestamp?: string;
   uid?: string;
+  ownerReferences?: {
+    apiVersion: string;
+    kind: string;
+    name: string;
+    uid: string;
+  }[];
 }
 
 export interface K8sCondition {
@@ -35,7 +41,21 @@ export interface K8sNode {
   };
 }
 
-// ── Pods ────────────────────────────────────────────────────────
+// ── Containers ──────────────────────────────────────────────────
+
+export interface K8sContainerSpec {
+  name: string;
+  image: string;
+  ports?: { containerPort: number; protocol?: string }[];
+  env?: { name: string; value?: string; valueFrom?: object }[];
+  resources?: {
+    requests?: Record<string, string>;
+    limits?: Record<string, string>;
+  };
+  volumeMounts?: { name: string; mountPath: string; readOnly?: boolean }[];
+  command?: string[];
+  args?: string[];
+}
 
 export interface K8sContainerStatus {
   name: string;
@@ -49,17 +69,46 @@ export interface K8sContainerStatus {
   image?: string;
 }
 
+// ── Pods ────────────────────────────────────────────────────────
+
 export interface K8sPod {
   metadata: K8sMetadata;
   spec: {
     nodeName?: string;
-    containers?: { name: string; image: string; ports?: { containerPort: number }[] }[];
+    containers?: K8sContainerSpec[];
+    initContainers?: K8sContainerSpec[];
+    volumes?: { name: string; [key: string]: unknown }[];
+    serviceAccountName?: string;
+    restartPolicy?: string;
   };
   status: {
     phase?: string;
     conditions?: K8sCondition[];
     containerStatuses?: K8sContainerStatus[];
+    initContainerStatuses?: K8sContainerStatus[];
     startTime?: string;
+    podIP?: string;
+    hostIP?: string;
+  };
+}
+
+// ── ReplicaSets ─────────────────────────────────────────────────
+
+export interface K8sReplicaSet {
+  metadata: K8sMetadata;
+  spec: {
+    replicas?: number;
+    selector?: { matchLabels?: Record<string, string> };
+    template?: {
+      spec?: {
+        containers?: K8sContainerSpec[];
+      };
+    };
+  };
+  status: {
+    replicas?: number;
+    readyReplicas?: number;
+    availableReplicas?: number;
   };
 }
 
@@ -70,9 +119,14 @@ export interface K8sDeployment {
   spec: {
     replicas?: number;
     selector?: { matchLabels?: Record<string, string> };
+    strategy?: { type?: string };
     template?: {
+      metadata?: K8sMetadata;
       spec?: {
-        containers?: { name: string; image: string; ports?: { containerPort: number }[] }[];
+        containers?: K8sContainerSpec[];
+        initContainers?: K8sContainerSpec[];
+        volumes?: { name: string; [key: string]: unknown }[];
+        serviceAccountName?: string;
       };
     };
   };
@@ -93,7 +147,7 @@ export interface K8sService {
   spec: {
     type?: string;
     clusterIP?: string;
-    ports?: { port: number; targetPort: number | string; protocol?: string; nodePort?: number }[];
+    ports?: { port: number; targetPort: number | string; protocol?: string; nodePort?: number; name?: string }[];
     selector?: Record<string, string>;
   };
 }
@@ -212,6 +266,46 @@ export interface RunnerPool {
     conditions?: K8sCondition[];
   };
 }
+
+// ── RBAC ────────────────────────────────────────────────────────
+
+export interface K8sServiceAccount {
+  metadata: K8sMetadata;
+  secrets?: { name: string }[];
+  automountServiceAccountToken?: boolean;
+}
+
+export interface K8sPolicyRule {
+  verbs: string[];
+  apiGroups?: string[];
+  resources?: string[];
+  resourceNames?: string[];
+  nonResourceURLs?: string[];
+}
+
+export interface K8sRole {
+  metadata: K8sMetadata;
+  rules?: K8sPolicyRule[];
+}
+
+export interface K8sRoleBinding {
+  metadata: K8sMetadata;
+  roleRef: {
+    apiGroup: string;
+    kind: string;
+    name: string;
+  };
+  subjects?: {
+    kind: string;
+    name: string;
+    namespace?: string;
+    apiGroup?: string;
+  }[];
+}
+
+// ClusterRole and ClusterRoleBinding share the same shape
+export type K8sClusterRole = K8sRole;
+export type K8sClusterRoleBinding = K8sRoleBinding;
 
 // ── Cluster Info ────────────────────────────────────────────────
 

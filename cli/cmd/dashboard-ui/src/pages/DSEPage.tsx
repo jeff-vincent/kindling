@@ -38,16 +38,19 @@ export function DSEPage() {
     setDeleteTarget(null);
   }
 
-  if (loading) return <div className="loading">Loading DSEs…</div>;
+  if (loading) return <div className="loading">Loading environments…</div>;
 
   const dses = data?.items || [];
 
   return (
     <div className="page">
       <div className="page-header">
-        <h1>Dev Staging Environments</h1>
+        <div className="page-header-left">
+          <h1>Dev Staging Environments</h1>
+          <p className="page-subtitle">Managed by the kindling operator</p>
+        </div>
         <div className="page-actions">
-          <ActionButton icon="➕" label="Deploy" onClick={() => setShowDeploy(true)} />
+          <ActionButton icon="+" label="Deploy" onClick={() => setShowDeploy(true)} />
         </div>
       </div>
 
@@ -62,7 +65,7 @@ export function DSEPage() {
           <label className="form-label">YAML Manifest</label>
           <textarea
             className="form-textarea"
-            rows={12}
+            rows={14}
             placeholder="Paste your DevStagingEnvironment YAML here..."
             value={yaml}
             onChange={(e) => setYaml(e.target.value)}
@@ -82,9 +85,9 @@ export function DSEPage() {
       )}
 
       {dses.length === 0 ? (
-        <EmptyState message="No DevStagingEnvironments found. Deploy one with: kindling deploy -f <file.yaml>" />
+        <EmptyState icon="◆" message="No DevStagingEnvironments found. Deploy one with: kindling deploy -f <file.yaml>" />
       ) : (
-        <div className="dse-list">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {dses.map((dse) => (
             <DSECard key={dse.metadata.name} dse={dse} onDelete={(ns, name) => setDeleteTarget({ ns, name })} />
           ))}
@@ -103,18 +106,18 @@ function DSECard({ dse, onDelete }: { dse: DSE; onDelete: (ns: string, name: str
   return (
     <div className="card card-wide">
       <div className="card-header">
-        <span className="card-icon">🚀</span>
+        <span className="card-icon">◆</span>
         <h3>{dse.metadata.name}</h3>
         <StatusBadge ok={!!allReady} label={allReady ? 'Ready' : 'Not Ready'} />
       </div>
       <div className="card-body">
-        <div className="card-grid">
+        <div className="card-body-grid">
           <div>
             <h4>Deployment</h4>
             <div className="stat-row"><span className="label">Image</span><span className="value mono">{dse.spec.deployment.image}</span></div>
             <div className="stat-row"><span className="label">Port</span><span className="value">{dse.spec.deployment.port}</span></div>
             <div className="stat-row"><span className="label">Replicas</span><span className="value">{s?.availableReplicas ?? 0} / {dse.spec.deployment.replicas ?? 1}</span></div>
-            <div className="stat-row"><span className="label">Health Check</span><span className="value mono">{dse.spec.deployment.healthCheck?.path || '—'}</span></div>
+            <div className="stat-row"><span className="label">Health</span><span className="value mono">{dse.spec.deployment.healthCheck?.path || '—'}</span></div>
             <div className="stat-row">
               <span className="label">Status</span>
               <StatusBadge ok={!!s?.deploymentReady} label={s?.deploymentReady ? 'Ready' : 'Pending'} />
@@ -167,13 +170,12 @@ function DSECard({ dse, onDelete }: { dse: DSE; onDelete: (ns: string, name: str
         </div>
 
         {dse.spec.deployment.env && dse.spec.deployment.env.length > 0 && (
-          <details className="env-details">
+          <details style={{ marginTop: 16 }}>
             <summary>Environment Variables ({dse.spec.deployment.env.length})</summary>
-            <table className="mini-table">
-              <thead><tr><th>Name</th><th>Value</th></tr></thead>
+            <table className="env-table" style={{ marginTop: 8 }}>
               <tbody>
                 {dse.spec.deployment.env.map((e, i) => (
-                  <tr key={i}><td className="mono">{e.name}</td><td className="mono text-dim">{e.value || '(from secret)'}</td></tr>
+                  <tr key={i}><td>{e.name}</td><td>{e.value || '(from secret)'}</td></tr>
                 ))}
               </tbody>
             </table>
@@ -189,7 +191,7 @@ function DSECard({ dse, onDelete }: { dse: DSE; onDelete: (ns: string, name: str
       </div>
       <div className="card-footer">
         <TimeAgo timestamp={dse.metadata.creationTimestamp} />
-        <ActionButton icon="🗑" label="Delete" onClick={() => onDelete(dse.metadata.namespace || 'default', dse.metadata.name)} danger small />
+        <ActionButton icon="✕" label="Delete" onClick={() => onDelete(dse.metadata.namespace || 'default', dse.metadata.name)} danger small />
       </div>
     </div>
   );

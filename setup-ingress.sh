@@ -29,7 +29,7 @@ kubectl apply -f config/registry/registry.yaml
 REGISTRY_DIR="/etc/containerd/certs.d/registry:5000"
 for node in $(kind get nodes --name "${KIND_CLUSTER_NAME:-dev}" 2>/dev/null); do
   docker exec "$node" mkdir -p "$REGISTRY_DIR"
-  docker exec "$node" sh -c "cat > ${REGISTRY_DIR}/hosts.toml" <<EOF
+  docker exec -i "$node" sh -c "cat > ${REGISTRY_DIR}/hosts.toml" <<EOF
 [host."http://localhost:5000"]
   capabilities = ["pull", "resolve", "push"]
 EOF

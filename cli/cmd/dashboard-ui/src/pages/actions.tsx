@@ -20,12 +20,13 @@ export function useToast() {
   return useContext(ToastContext);
 }
 
+let _toastId = 0;
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
-  let nextId = 0;
 
   const toast = useCallback((message: string, type: 'success' | 'error') => {
-    const id = ++nextId;
+    const id = ++_toastId;
     setToasts((t) => [...t, { id, message, type }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
@@ -36,7 +37,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       <div className="toast-container">
         {toasts.map((t) => (
           <div key={t.id} className={`toast toast-${t.type}`}>
-            <span>{t.type === 'success' ? '✅' : '❌'}</span>
+            <span>{t.type === 'success' ? '✓' : '✕'}</span>
             <span>{t.message}</span>
           </div>
         ))}
@@ -72,7 +73,7 @@ export function ConfirmDialog({
           <p>{message}</p>
         </div>
         <div className="modal-footer">
-          <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
+          <button className="btn" onClick={onCancel}>Cancel</button>
           <button
             className={`btn ${danger ? 'btn-danger' : 'btn-primary'}`}
             onClick={onConfirm}
@@ -107,13 +108,13 @@ export function ActionModal({
       <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h3>{title}</h3>
-          <button className="btn btn-sm" onClick={onClose}>✕</button>
+          <button className="btn btn-sm btn-ghost" onClick={onClose}>✕</button>
         </div>
         <div className="modal-body">
           {children}
         </div>
         <div className="modal-footer">
-          <button className="btn btn-secondary" onClick={onClose} disabled={loading}>Cancel</button>
+          <button className="btn" onClick={onClose} disabled={loading}>Cancel</button>
           <button className="btn btn-primary" onClick={onSubmit} disabled={loading}>
             {loading ? 'Working…' : submitLabel}
           </button>
@@ -132,6 +133,7 @@ export function ActionButton({
   danger = false,
   small = false,
   disabled = false,
+  ghost = false,
 }: {
   label: string;
   icon?: string;
@@ -139,15 +141,18 @@ export function ActionButton({
   danger?: boolean;
   small?: boolean;
   disabled?: boolean;
+  ghost?: boolean;
 }) {
+  const cls = [
+    'btn',
+    danger ? 'btn-danger' : ghost ? 'btn-ghost' : 'btn-primary',
+    small ? 'btn-sm' : '',
+  ].filter(Boolean).join(' ');
+
   return (
-    <button
-      className={`btn ${danger ? 'btn-danger' : 'btn-primary'} ${small ? 'btn-sm' : ''}`}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      {icon && <span>{icon} </span>}
-      {label}
+    <button className={cls} onClick={onClick} disabled={disabled}>
+      {icon && <span>{icon}</span>}
+      {label && <span>{label}</span>}
     </button>
   );
 }

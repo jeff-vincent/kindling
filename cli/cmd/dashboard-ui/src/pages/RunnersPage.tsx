@@ -44,11 +44,14 @@ export function RunnersPage() {
   return (
     <div className="page">
       <div className="page-header">
-        <h1>GitHub Actions Runner Pools</h1>
+        <div className="page-header-left">
+          <h1>GitHub Actions Runners</h1>
+          <p className="page-subtitle">Self-hosted runner pools in the cluster</p>
+        </div>
         <div className="page-actions">
-          <ActionButton icon="➕" label="Create Runner" onClick={() => setShowCreate(true)} />
+          <ActionButton icon="+" label="Create Runner" onClick={() => setShowCreate(true)} />
           {pools.length > 0 && (
-            <ActionButton icon="🔄" label="Reset All" onClick={() => setShowReset(true)} danger />
+            <ActionButton icon="↻" label="Reset All" onClick={() => setShowReset(true)} danger />
           )}
         </div>
       </div>
@@ -85,9 +88,9 @@ export function RunnersPage() {
       )}
 
       {pools.length === 0 ? (
-        <EmptyState message="No runner pools configured. Create one with: kindling runners" />
+        <EmptyState icon="▶" message="No runner pools configured. Create one to get started." />
       ) : (
-        <div className="dse-list">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {pools.map((pool) => (
             <RunnerCard key={pool.metadata.name} pool={pool} />
           ))}
@@ -104,19 +107,19 @@ function RunnerCard({ pool }: { pool: RunnerPool }) {
   return (
     <div className="card card-wide">
       <div className="card-header">
-        <span className="card-icon">🏃</span>
+        <span className="card-icon">▶</span>
         <h3>{pool.metadata.name}</h3>
         <StatusBadge ok={ready} label={ready ? 'Ready' : 'Pending'} />
       </div>
       <div className="card-body">
-        <div className="card-grid">
+        <div className="card-body-grid">
           <div>
-            <h4>Config</h4>
+            <h4>Configuration</h4>
             <div className="stat-row"><span className="label">User</span><span className="value">{pool.spec.githubUsername}</span></div>
             <div className="stat-row"><span className="label">Repo</span><span className="value mono">{pool.spec.repository}</span></div>
             <div className="stat-row"><span className="label">Replicas</span><span className="value">{s?.readyRunners ?? 0} / {pool.spec.replicas ?? 1}</span></div>
             {pool.spec.labels && pool.spec.labels.length > 0 && (
-              <div className="stat-row"><span className="label">Labels</span><span className="value mono">{pool.spec.labels.join(', ')}</span></div>
+              <div className="stat-row"><span className="label">Labels</span><span className="value">{pool.spec.labels.map(l => <span key={l} className="tag" style={{ marginLeft: 2 }}>{l}</span>)}</span></div>
             )}
           </div>
           <div>
@@ -137,7 +140,7 @@ function RunnerCard({ pool }: { pool: RunnerPool }) {
             )}
             {s?.devEnvironmentRef && (
               <div className="stat-row">
-                <span className="label">Last DSE</span>
+                <span className="label">DSE</span>
                 <span className="value mono">{s.devEnvironmentRef}</span>
               </div>
             )}

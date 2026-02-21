@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -187,7 +190,7 @@ func handleCreateRunner(w http.ResponseWriter, r *http.Request) {
 	outputs = append(outputs, out)
 
 	// 2. Apply runner pool CR
-	yaml := fmt.Sprintf(`apiVersion: apps.kindling.io/v1alpha1
+	yaml := fmt.Sprintf(`apiVersion: apps.example.com/v1alpha1
 kind: GithubActionRunnerPool
 metadata:
   name: %s-runner-pool
@@ -195,6 +198,9 @@ metadata:
 spec:
   githubUsername: %s
   repository: %s
+  tokenSecretRef:
+    name: github-runner-token
+    key: github-token
   replicas: 1
   labels:
     - kindling`, body.Username, body.Username, body.Repo)
@@ -355,7 +361,7 @@ func handleEnvList(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── POST /api/expose ────────────────────────────────────────────
-// Starts a cloudflared tunnel. Body: {} (empty is fine)
+// Starts a cloudflared tunnel. Body: { "service": "my-ingress" } (optional)
 
 func handleExposeAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
@@ -371,55 +377,118 @@ func handleExposeAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if already running
-	if _, err := os.Stat("/tmp/kindling-tunnel.pid"); err == nil {
-		actionErr(w, "tunnel already running — stop it first", http.StatusConflict)
-		return
+	// Check if already running — verify the PID is actually alive.
+	if pidBytes, err := os.ReadFile("/tmp/kindling-tunnel.pid"); err == nil {
+		var pid int
+		fmt.Sscanf(string(pidBytes), "%d", &pid)
+		if proc, err := os.FindProcess(pid); err == nil {
+			if proc.Signal(syscall.Signal(0)) == nil {
+				actionErr(w, "tunnel already running — stop it first", http.StatusConflict)
+				return
+			}
+		}
+		// Stale PID file — clean up before starting fresh.
+		os.Remove("/tmp/kindling-tunnel.pid")
+		os.Remove("/tmp/kindling-tunnel.log")
 	}
 
-	// Start cloudflared quick tunnel
+	// Kill any orphaned cloudflared tunnel processes to avoid conflicts.
+	exec.Command("pkill", "-f", "cloudflared tunnel --url").Run()
+
+	// Parse optional service from body
+	var body struct {
+		Service string `json:"service"`
+	}
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&body)
+	}
+
+	// Set up a log file for output capture.
 	logFile, err := os.Create("/tmp/kindling-tunnel.log")
 	if err != nil {
 		actionErr(w, "failed to create log file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Use a pipe so we can read stderr in real-time without racing on the file.
+	pr, pw := io.Pipe()
+
 	cmd := exec.Command("cloudflared", "tunnel", "--url", "http://localhost:80")
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd.Stdout = nil
+	cmd.Stderr = io.MultiWriter(logFile, pw)
+	// Detach from parent process group so cloudflared survives if the dashboard restarts.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
+		pw.Close()
 		actionErr(w, "failed to start cloudflared: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Save PID
+	// Save PID immediately.
 	os.WriteFile("/tmp/kindling-tunnel.pid", []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
 
-	// Wait a moment and try to get the URL
+	// Read stderr into a buffer in the background.
+	var stderrBuf bytes.Buffer
+	var mu sync.Mutex
 	go func() {
-		logFile.Close()
-		cmd.Wait()
+		buf := make([]byte, 4096)
+		for {
+			n, err := pr.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				stderrBuf.Write(buf[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
 	}()
 
-	time.Sleep(3 * time.Second)
-	logContent, _ := os.ReadFile("/tmp/kindling-tunnel.log")
-	url := ""
-	for _, line := range strings.Split(string(logContent), "\n") {
-		if strings.Contains(line, "https://") && strings.Contains(line, ".trycloudflare.com") {
-			for _, word := range strings.Fields(line) {
-				if strings.HasPrefix(word, "https://") {
-					url = word
-					break
+	// Let the process run independently.
+	go func() {
+		cmd.Wait()
+		pw.Close()
+		logFile.Close()
+	}()
+
+	// Poll for the tunnel URL (cloudflared can take several seconds).
+	tunnelURL := ""
+	for i := 0; i < 20; i++ {
+		time.Sleep(1 * time.Second)
+		mu.Lock()
+		data := stderrBuf.String()
+		mu.Unlock()
+		for _, line := range strings.Split(data, "\n") {
+			if strings.Contains(line, ".trycloudflare.com") {
+				for _, word := range strings.Fields(line) {
+					if strings.HasPrefix(word, "https://") {
+						tunnelURL = strings.TrimRight(word, "|, ")
+						break
+					}
 				}
 			}
 		}
+		if tunnelURL != "" {
+			break
+		}
 	}
 
-	if url != "" {
-		actionOK(w, "Tunnel started: "+url)
+	// Patch ingress hosts to route through the tunnel.
+	if tunnelURL != "" {
+		exposeService = body.Service
+		patchIngressesForTunnel(tunnelURL)
+		actionOK(w, "Tunnel started: "+tunnelURL)
 	} else {
-		actionOK(w, "Tunnel started (URL may take a moment to appear in logs)")
+		// Couldn't detect URL — kill the orphan process.
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		os.Remove("/tmp/kindling-tunnel.pid")
+		os.Remove("/tmp/kindling-tunnel.log")
+		actionErr(w, "Tunnel started but could not detect public URL — try again or use the CLI", http.StatusInternalServerError)
 	}
 }
 
@@ -428,7 +497,10 @@ func handleExposeAction(w http.ResponseWriter, r *http.Request) {
 func handleUnexpose(w http.ResponseWriter, r *http.Request) {
 	pidBytes, err := os.ReadFile("/tmp/kindling-tunnel.pid")
 	if err != nil {
-		actionErr(w, "no tunnel running", http.StatusNotFound)
+		// No PID file — try to clean up orphans anyway.
+		exec.Command("pkill", "-f", "cloudflared tunnel --url").Run()
+		restoreIngresses()
+		actionOK(w, "Tunnel stopped")
 		return
 	}
 	var pid int
@@ -438,8 +510,15 @@ func handleUnexpose(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		proc.Kill()
 	}
+	// Also kill any orphaned cloudflared processes.
+	exec.Command("pkill", "-f", "cloudflared tunnel --url").Run()
+
 	os.Remove("/tmp/kindling-tunnel.pid")
 	os.Remove("/tmp/kindling-tunnel.log")
+
+	// Restore original ingress hosts
+	restoreIngresses()
+
 	actionOK(w, "Tunnel stopped")
 }
 
@@ -458,10 +537,18 @@ func handleExposeStatus(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(string(pidBytes), "%d", &pid)
 		proc, err := os.FindProcess(pid)
 		if err == nil {
-			// On Unix, signal 0 checks if process exists
-			if err := proc.Signal(os.Signal(nil)); err == nil {
+			// Signal 0 checks if process exists without sending a real signal
+			if err := proc.Signal(syscall.Signal(0)); err == nil {
 				status.Running = true
 			}
+		}
+
+		if !status.Running {
+			// Stale PID file — clean up
+			os.Remove("/tmp/kindling-tunnel.pid")
+			os.Remove("/tmp/kindling-tunnel.log")
+			jsonResponse(w, status)
+			return
 		}
 
 		logContent, _ := os.ReadFile("/tmp/kindling-tunnel.log")
@@ -469,7 +556,7 @@ func handleExposeStatus(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(line, ".trycloudflare.com") {
 				for _, word := range strings.Fields(line) {
 					if strings.HasPrefix(word, "https://") {
-						status.URL = word
+						status.URL = strings.TrimRight(word, "|, ")
 						break
 					}
 				}
