@@ -181,7 +181,7 @@ func handleCreateRunner(w http.ResponseWriter, r *http.Request) {
 	// 1. Create/update github-runner-token secret
 	captureKubectl("delete", "secret", "github-runner-token", "-n", "default", "--ignore-not-found")
 	out, err := captureKubectl("create", "secret", "generic", "github-runner-token",
-		"--from-literal=GITHUB_TOKEN="+body.Token,
+		"--from-literal=github-token="+body.Token,
 		"-n", "default")
 	if err != nil {
 		actionErr(w, "failed to create token secret: "+out, http.StatusInternalServerError)
