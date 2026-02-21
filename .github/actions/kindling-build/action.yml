@@ -23,6 +23,10 @@ inputs:
     description: "tar --exclude patterns (space-separated, e.g. './ui ./.git')"
     required: false
     default: ""
+  dockerfile:
+    description: "Path to Dockerfile relative to context (default: Dockerfile)"
+    required: false
+    default: ""
   timeout:
     description: "Max seconds to wait for the build to complete"
     required: false
@@ -38,6 +42,7 @@ runs:
         BUILD_CONTEXT: ${{ inputs.context }}
         BUILD_IMAGE: ${{ inputs.image }}
         BUILD_EXCLUDE: ${{ inputs.exclude }}
+        BUILD_DOCKERFILE: ${{ inputs.dockerfile }}
         BUILD_TIMEOUT: ${{ inputs.timeout }}
       run: |
         echo "🏗️  Building ${BUILD_NAME} → ${BUILD_IMAGE}"
@@ -55,6 +60,9 @@ runs:
 
         # ── Trigger sidecar build ────────────────────────────────
         echo "${BUILD_IMAGE}" > /builds/${BUILD_NAME}.dest
+        if [ -n "${BUILD_DOCKERFILE}" ]; then
+          echo "${BUILD_DOCKERFILE}" > /builds/${BUILD_NAME}.dockerfile
+        fi
         touch /builds/${BUILD_NAME}.request
 
         # ── Wait for completion ──────────────────────────────────

@@ -567,6 +567,12 @@ while true; do
     DEST=$(cat "${BUILDS_DIR}/${SERVICE}.dest")
     echo "   destination: ${DEST}"
 
+    DOCKERFILE_FLAG=""
+    if [ -f "${BUILDS_DIR}/${SERVICE}.dockerfile" ]; then
+      DOCKERFILE_FLAG="--dockerfile=$(cat "${BUILDS_DIR}/${SERVICE}.dockerfile")"
+      echo "   dockerfile: $(cat "${BUILDS_DIR}/${SERVICE}.dockerfile")"
+    fi
+
     mv "$req" "${req}.processing"
 
     kubectl delete pod "kaniko-${SERVICE}" 2>/dev/null || true
@@ -580,6 +586,9 @@ while true; do
          --insecure \
          --cache=true \
          --cache-repo=registry:5000/cache \
+         --push-retry=3 \
+         --skip-push-permission-check \
+         ${DOCKERFILE_FLAG} \
       > "${BUILDS_DIR}/${SERVICE}.log" 2>&1
     EXIT_CODE=$?
 
