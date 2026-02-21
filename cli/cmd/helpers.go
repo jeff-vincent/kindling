@@ -123,8 +123,13 @@ func resolveProjectDir() (string, error) {
 	cachedDir := filepath.Join(home, ".kindling")
 
 	if _, err := os.Stat(filepath.Join(cachedDir, "kind-config.yaml")); err == nil {
-		// Already cloned — pull latest
+		// Already cloned — fix remote if pointing to old org, then pull latest
 		step("📂", fmt.Sprintf("Using cached project at %s", cachedDir))
+		remote, _ := runCapture("git", "-C", cachedDir, "remote", "get-url", "origin")
+		if strings.Contains(remote, "jeff-vincent/kindling") {
+			_ = runDir(cachedDir, "git", "remote", "set-url", "origin",
+				"https://github.com/kindling-sh/kindling.git")
+		}
 		_ = runDir(cachedDir, "git", "pull", "--ff-only", "-q")
 		return cachedDir, nil
 	}
@@ -132,7 +137,7 @@ func resolveProjectDir() (string, error) {
 	// Clone
 	step("📥", "Cloning kindling project to ~/.kindling")
 	if err := run("git", "clone", "--depth=1",
-		"https://github.com/jeff-vincent/kindling.git", cachedDir); err != nil {
+		"https://github.com/kindling-sh/kindling.git", cachedDir); err != nil {
 		return "", fmt.Errorf("failed to clone kindling repo to %s: %w", cachedDir, err)
 	}
 	return cachedDir, nil
