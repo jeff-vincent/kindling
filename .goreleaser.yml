@@ -42,6 +42,27 @@ changelog:
       - "^ci:"
       - "^chore:"
 
+brews:
+  - ids:
+      - kindling-cli
+    repository:
+      owner: kindling-sh
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/kindling-sh/kindling"
+    description: "Local Kubernetes dev environments powered by Kind — push code, your laptop builds & runs it"
+    license: "Apache-2.0"
+    commit_author:
+      name: kindling-bot
+      email: bot@kindling.sh
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    dependencies:
+      - name: kind
+      - name: kubectl
+    test: |
+      system "#{bin}/kindling", "version"
+
 release:
   github:
     owner: kindling-sh
