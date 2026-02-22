@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -38,6 +39,7 @@ var (
 	genProvider string
 	genModel    string
 	genOutput   string
+	genBranch   string
 	genDryRun   bool
 )
 
@@ -47,6 +49,7 @@ func init() {
 	generateCmd.Flags().StringVar(&genProvider, "provider", "openai", "AI provider: openai or anthropic")
 	generateCmd.Flags().StringVar(&genModel, "model", "", "Model name (default: gpt-4o for openai, claude-sonnet-4-20250514 for anthropic)")
 	generateCmd.Flags().StringVarP(&genOutput, "output", "o", "", "Output path (default: <repo-path>/.github/workflows/dev-deploy.yml)")
+	generateCmd.Flags().StringVarP(&genBranch, "branch", "b", "", "Branch to trigger on (default: auto-detect from git, fallback to 'main')")
 	generateCmd.Flags().BoolVar(&genDryRun, "dry-run", false, "Print the generated workflow to stdout instead of writing a file")
 	_ = generateCmd.MarkFlagRequired("api-key")
 	rootCmd.AddCommand(generateCmd)
@@ -75,6 +78,16 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		genOutput = filepath.Join(repoPath, ".github", "workflows", "dev-deploy.yml")
 	}
 
+	// Auto-detect default branch from git if not specified
+	if genBranch == "" {
+		out, err := exec.Command("git", "-C", repoPath, "symbolic-ref", "--short", "HEAD").Output()
+		if err == nil {
+			genBranch = strings.TrimSpace(string(out))
+		} else {
+			genBranch = "main"
+		}
+	}
+
 	// ── Scan the repository ─────────────────────────────────────
 	header("Analyzing repository")
 	step("📂", repoPath)
@@ -83,6 +96,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("repo scan failed: %w", err)
 	}
+	repoCtx.branch = genBranch
 
 	success(fmt.Sprintf("Found %d Dockerfile(s), %d dependency manifest(s), %d source file(s)",
 		repoCtx.dockerfileCount, repoCtx.depFileCount, len(repoCtx.sourceSnippets)))
@@ -167,6 +181,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 // that will be sent to the AI as context.
 type repoContext struct {
 	name              string
+	branch            string
 	tree              string
 	dockerfiles       map[string]string // relative path → content
 	depFiles          map[string]string // relative path → content
@@ -219,6 +234,11 @@ var scanSkipDirs = map[string]bool{
 
 // Dependency manifests worth reading.
 var scanDepFiles = map[string]bool{
+	// Environment configuration templates (required env vars)
+	".env.sample":      true,
+	".env.example":     true,
+	".env.development": true,
+	".env.template":    true,
 	// Go
 	"go.mod": true,
 	// JavaScript / TypeScript
@@ -561,7 +581,7 @@ func buildGeneratePrompt(ctx *repoContext) (system, user string) {
 You generate dev-deploy.yml workflow files that use two reusable composite actions:
 
 1. kindling-build — builds a container image via Kaniko sidecar
-   Uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+   Uses: kindling-sh/kindling/.github/actions/kindling-build@main
    Inputs: name (required), context (required), image (required), exclude (optional), timeout (optional)
    IMPORTANT: kindling-build runs the Dockerfile found at <context>/Dockerfile as-is
    using Kaniko inside the cluster. It does NOT modify or generate Dockerfiles.
@@ -571,7 +591,7 @@ You generate dev-deploy.yml workflow files that use two reusable composite actio
    the service's Dockerfile.
 
 2. kindling-deploy — deploys a DevStagingEnvironment CR via sidecar
-   Uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+   Uses: kindling-sh/kindling/.github/actions/kindling-deploy@main
    Inputs: name (required), image (required), port (required),
            labels, env, dependencies, ingress-host, ingress-class,
            health-check-path, replicas, service-type, wait
@@ -582,7 +602,7 @@ Key conventions you MUST follow:
 - Runner: runs-on: [self-hosted, "${{ github.actor }}"]
 - Ingress host pattern: ${{ github.actor }}-<service>.localhost
 - DSE name pattern: ${{ github.actor }}-<service>
-- Always trigger on push to main + workflow_dispatch
+- Always trigger on push to the default branch (specified below) + workflow_dispatch
 - Always include a "Checkout code" step with actions/checkout@v4
 - Always include a "Clean builds directory" step immediately after checkout
 - For multi-service repos, build all images first, then deploy in dependency order
@@ -638,6 +658,55 @@ references across ALL common languages:
 - docker-compose.yml service names (postgres, redis, mysql, mongo, rabbitmq, etc.)
 - Environment variable references in code (DATABASE_URL, REDIS_URL, MONGO_URL, etc.)
 
+CRITICAL — Dependency connection URLs are auto-injected:
+When you declare a dependency in the "dependencies" input, the kindling operator
+AUTOMATICALLY injects the corresponding connection URL environment variable into the
+application container. You MUST NOT include these env vars in the "env" input — they
+will be duplicated, and any secretKeyRef will fail because no such secret exists.
+
+Auto-injected env vars by dependency type:
+  postgres       → DATABASE_URL  (e.g. postgres://devuser:devpass@<name>-postgres:5432/devdb?sslmode=disable)
+  redis          → REDIS_URL     (e.g. redis://<name>-redis:6379/0)
+  mysql          → DATABASE_URL  (e.g. mysql://devuser:devpass@<name>-mysql:3306/devdb)
+  mongodb        → MONGO_URL     (e.g. mongodb://devuser:devpass@<name>-mongodb:27017)
+  rabbitmq       → AMQP_URL      (e.g. amqp://devuser:devpass@<name>-rabbitmq:5672)
+  minio          → S3_ENDPOINT   (e.g. http://<name>-minio:9000)
+  elasticsearch  → ELASTICSEARCH_URL (e.g. http://<name>-elasticsearch:9200)
+  kafka          → KAFKA_BROKER_URL  (e.g. <name>-kafka:9092)
+  nats           → NATS_URL      (e.g. nats://<name>-nats:4222)
+  memcached      → MEMCACHED_URL (e.g. <name>-memcached:11211)
+  cassandra      → CASSANDRA_URL (e.g. <name>-cassandra:9042)
+  consul         → CONSUL_HTTP_ADDR (e.g. http://<name>-consul:8500)
+  vault          → VAULT_ADDR    (e.g. http://<name>-vault:8200)
+  influxdb       → INFLUXDB_URL  (e.g. http://<name>-influxdb:8086)
+  jaeger         → JAEGER_ENDPOINT (e.g. http://<name>-jaeger:16686)
+
+So if you write "dependencies: postgres, redis", do NOT also write:
+  env: |
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef: ...     ← WRONG, will fail
+    - name: REDIS_URL
+      value: "redis://..."    ← WRONG, duplicates auto-injected value
+
+The ONLY env vars that belong in the "env" input are:
+  1. Truly external credentials (API keys, tokens, third-party DSNs) as secretKeyRef
+  2. App configuration that is NOT a dependency connection URL (e.g. NODE_ENV, LOG_LEVEL)
+  3. Env vars that reference an auto-injected URL via variable expansion, e.g.:
+       - name: ADDITIONAL_DB
+         value: "$(DATABASE_URL)&options=extra"
+  4. When the app uses a DIFFERENT env var name than the auto-injected one, map it
+     using variable expansion. For example, if the app expects CELERY_BROKER_URL but
+     the dependency is rabbitmq (which auto-injects AMQP_URL):
+       - name: CELERY_BROKER_URL
+         value: "$(AMQP_URL)"
+     Similarly for CELERY_RESULT_BACKEND when redis auto-injects REDIS_URL:
+       - name: CELERY_RESULT_BACKEND
+         value: "$(REDIS_URL)"
+     Check the app's source code, docker-compose environment, and .env files to
+     discover what env var names the app actually uses for each dependency connection.
+     If the app's name differs from the auto-injected name, add the mapping.
+
 Build timeout guidance:
 The default kindling-build timeout is 300 seconds (5 minutes). This is sufficient for
 interpreted languages and lightweight compiled languages (Go, TypeScript, Python, Ruby,
@@ -648,6 +717,120 @@ Set timeout: "900" (15 minutes) on the kindling-build step for services written 
   - C#/.NET (dotnet restore + publish)
   - Elixir (Mix deps.get + compilation of dependencies)
 Only add the timeout input when it differs from the default 300.
+
+CRITICAL — Kaniko vs Docker BuildKit compatibility:
+kindling-build uses Kaniko, NOT Docker BuildKit. Kaniko does NOT support:
+  - Automatic BuildKit platform ARGs: BUILDPLATFORM, TARGETPLATFORM, TARGETARCH, TARGETOS, TARGETVARIANT
+  - FROM --platform=${BUILDPLATFORM} syntax
+If a Dockerfile uses any of these (common in .NET, cross-compiled Go, and multi-arch images),
+the build WILL fail because the ARG values will be empty.
+
+IMPORTANT: Only patch what is specifically broken. Do NOT touch ARG lines that are NOT
+BuildKit platform ARGs. Application-level ARGs like ARG APP_PATH, ARG BASE_IMAGE,
+ARG ENVIRONMENT, ARG CDN_URL, etc. are perfectly valid in Kaniko and MUST be left alone.
+Kaniko fully supports ARG, ENV, FROM ${VAR}, and multi-stage builds.
+If a Dockerfile has NO known Kaniko issues (no BuildKit platform ARGs, no poetry,
+no npm, no go build without -buildvcs=false), do NOT generate a patch step at all.
+
+When you detect a Dockerfile that uses BuildKit platform ARGs, you MUST generate a
+"Patch Dockerfile for Kaniko" step BEFORE the kindling-build step for that service.
+The patch step should:
+  1. Remove "--platform=${BUILDPLATFORM}" from any FROM line
+  2. Remove the ARG TARGETPLATFORM, ARG TARGETARCH, ARG BUILDPLATFORM, ARG TARGETOS declarations
+  3. Replace any usage of $TARGETARCH or ${TARGETARCH} with the concrete architecture (amd64)
+  4. Replace any usage of $TARGETPLATFORM or ${TARGETPLATFORM} with linux/amd64
+  5. Replace any usage of $BUILDPLATFORM or ${BUILDPLATFORM} with linux/amd64
+
+Example patch step for a .NET worker with BuildKit ARGs:
+  - name: Patch worker Dockerfile for Kaniko
+    shell: bash
+    run: |
+      cd ${{ github.workspace }}/worker
+      # Remove --platform=${BUILDPLATFORM} from FROM lines
+      sed -i 's/FROM --platform=\${BUILDPLATFORM} /FROM /g' Dockerfile
+      # Remove BuildKit ARG declarations
+      sed -i '/^ARG TARGETPLATFORM$/d' Dockerfile
+      sed -i '/^ARG TARGETARCH$/d' Dockerfile
+      sed -i '/^ARG BUILDPLATFORM$/d' Dockerfile
+      sed -i '/^ARG TARGETOS$/d' Dockerfile
+      sed -i '/^ARG TARGETVARIANT$/d' Dockerfile
+      # Replace architecture variables with concrete amd64 values
+      sed -i 's/\$TARGETARCH/amd64/g; s/\${TARGETARCH}/amd64/g' Dockerfile
+      sed -i 's/\$TARGETPLATFORM/linux\/amd64/g; s/\${TARGETPLATFORM}/linux\/amd64/g' Dockerfile
+      sed -i 's/\$BUILDPLATFORM/linux\/amd64/g; s/\${BUILDPLATFORM}/linux\/amd64/g' Dockerfile
+      sed -i 's/\$TARGETOS/linux/g; s/\${TARGETOS}/linux/g' Dockerfile
+
+Additional Kaniko compatibility issues that require Dockerfile patching:
+
+Go VCS stamping:
+Kaniko does NOT have a .git directory. Go 1.18+ embeds VCS info by default, which
+causes "error obtaining VCS status: exit status 128" and fails the build.
+When a Go Dockerfile contains "go build" WITHOUT "-buildvcs=false", you MUST add a
+patch step to inject it. Use sed to replace "go build" with "go build -buildvcs=false"
+in the Dockerfile:
+  sed -i 's/go build /go build -buildvcs=false /g' Dockerfile
+
+Poetry install without --no-root:
+When ANY Dockerfile in the repo uses "poetry install" WITHOUT "--no-root", Poetry tries to
+install the current project as a package — this fails if README.md or other metadata
+files are missing from the build context. You MUST ALWAYS patch "poetry install" to
+"poetry install --no-root" in EVERY Dockerfile that uses poetry. This is NOT optional.
+ALWAYS add a patch step for this before the build step:
+  sed -i 's/poetry install/poetry install --no-root/g' Dockerfile
+If the Dockerfile is specified via the "dockerfile" input (not at context root), adjust the path:
+  sed -i 's/poetry install/poetry install --no-root/g' path/to/Dockerfile
+
+RUN --mount=type=cache:
+Kaniko ignores --mount=type=cache flags (they're BuildKit-only cache mounts).
+The build will still work but without caching. No patching is needed for this —
+it's safe to leave as-is.
+
+npm cache permissions:
+Kaniko's filesystem snapshotting changes ownership of /root/.npm between layers,
+causing "EACCES: permission denied" errors on npm install, npm run build, etc.
+When ANY Dockerfile uses npm (npm install, npm run build, npm ci, etc.), you MUST
+patch it to redirect the npm cache to /tmp/.npm by inserting an ENV line after the
+FROM line. Use sed to insert it:
+  sed -i '/^FROM /a ENV npm_config_cache=/tmp/.npm' Dockerfile
+This MUST be included in the patch step for every Node.js/npm-based service.
+
+ONLY generate a Kaniko patch step when the Dockerfile has one or more of these specific issues:
+  1. BuildKit platform ARGs (TARGETARCH, BUILDPLATFORM, etc.)
+  2. "poetry install" without "--no-root"
+  3. npm usage (needs npm_config_cache redirect)
+  4. "go build" without "-buildvcs=false"
+If NONE of these apply, do NOT generate a patch step — the Dockerfile works as-is.
+
+Combine all Kaniko patches for a service into a SINGLE "Patch <service> Dockerfile for Kaniko"
+step BEFORE the corresponding build step. Examples:
+
+Python service with poetry:
+  - name: Patch backend Dockerfile for Kaniko
+    shell: bash
+    run: |
+      cd ${{ github.workspace }}/backend
+      sed -i 's/poetry install/poetry install --no-root/g' Dockerfile
+
+Python service where Dockerfile is NOT at context root (uses "dockerfile" input):
+  - name: Patch daily-job Dockerfile for Kaniko
+    shell: bash
+    run: |
+      cd ${{ github.workspace }}/backend
+      sed -i 's/poetry install/poetry install --no-root/g' jobs/daily/Dockerfile
+
+Go service with VCS issues:
+  - name: Patch api Dockerfile for Kaniko
+    shell: bash
+    run: |
+      cd ${{ github.workspace }}/api
+      sed -i 's/go build /go build -buildvcs=false /g' Dockerfile
+
+Node.js/npm service:
+  - name: Patch frontend Dockerfile for Kaniko
+    shell: bash
+    run: |
+      cd ${{ github.workspace }}/frontend
+      sed -i '/^FROM /a ENV npm_config_cache=/tmp/.npm' Dockerfile
 
 Common Dockerfile pitfalls to be aware of when reviewing repo structure:
   - Go: if go.sum is missing, the Dockerfile must run "go mod tidy" before "go build"
@@ -662,19 +845,102 @@ For multi-service repos (multiple Dockerfiles in subdirectories), generate one
 build step per service and one deploy step per service, with inter-service env
 vars wired up (e.g. API_URL pointing to the other service's cluster-internal DNS name).
 
-External credentials and secrets:
-When the user's code references external credentials (API keys, tokens, DSNs, etc.),
-wire them into the deploy step's "env" input as Kubernetes Secret references.
-Use this pattern for each detected credential:
-  <VAR_NAME>:
-    secretKeyRef:
-      name: kindling-secret-<lowercase-var-name>
-      key: value
-These secrets are managed by "kindling secrets set <NAME> <VALUE>" and stored as
-Kubernetes Secrets with the label app.kubernetes.io/managed-by=kindling.
-Include a YAML comment above the env block noting which secrets need to be set:
-  # Requires: kindling secrets set <NAME> <VALUE>
-Do NOT hardcode placeholder values for secrets. Always use secretKeyRef.
+Docker build context vs Dockerfile path:
+When a docker-compose.yml exists, ALWAYS check it to determine the correct build
+"context" and "dockerfile" for each service. Many repos use a DIFFERENT context
+directory than where the Dockerfile lives. For example:
+  docker-compose.yml:
+    my_job:
+      build:
+        context: ./backend/           # <-- build context is the parent
+        dockerfile: jobs/daily/Dockerfile  # <-- Dockerfile path relative to context
+In this case the kindling-build step MUST use:
+  context: ${{ github.workspace }}/backend
+  dockerfile: jobs/daily/Dockerfile
+NOT context: ${{ github.workspace }}/backend/jobs/daily (which would be wrong
+because the Dockerfile expects files from the parent backend/ directory like
+pyproject.toml, poetry.lock, etc.).
+The kindling-build action supports a "dockerfile" input for this — use it whenever
+the Dockerfile is not at the root of the build context:
+  - name: Build daily job image
+    uses: kindling-sh/kindling/.github/actions/kindling-build@main
+    with:
+      name: daily-job
+      context: ${{ github.workspace }}/backend
+      dockerfile: jobs/daily/Dockerfile
+      image: "${{ env.REGISTRY }}/daily-job:${{ env.TAG }}"
+
+CRITICAL — Dev staging environment philosophy:
+This generates a LOCAL DEV environment, NOT production. The goal is for the app
+to start and be usable with ZERO manual secret setup. Follow these rules:
+
+1. Dependency connection URLs and passwords are ALREADY handled by the operator.
+   When you declare a dependency (postgres, redis, etc.), the operator auto-injects
+   the connection URL (DATABASE_URL, REDIS_URL, etc.) AND manages the dependency
+   container's credentials internally. Do NOT add any of these to the env block:
+   - DATABASE_URL, REDIS_URL, MONGO_URL, AMQP_URL, S3_ENDPOINT, etc.
+   - POSTGRES_PASSWORD, DATABASE_PASSWORD, REDIS_PASSWORD, MYSQL_PASSWORD, etc.
+   - POSTGRES_USER, POSTGRES_DB, MYSQL_USER, MYSQL_DATABASE, etc.
+
+2. App-level secrets (SECRET_KEY, SESSION_SECRET, JWT_SECRET, UTILS_SECRET,
+   ENCRYPTION_KEY, etc.) should be set as plain env vars with a generated
+   dev-safe random hex value. Example:
+     - name: SECRET_KEY
+       value: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+     - name: UTILS_SECRET
+       value: "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"
+   Generate a DIFFERENT 64-char hex string for each secret.
+
+3. Optional external integrations should be OMITTED entirely from the env block.
+   These are not needed for local dev and including them as secretKeyRef will
+   cause the pod to fail with CreateContainerConfigError. Skip:
+   - Cloud storage (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, GCS_*, AZURE_STORAGE_*)
+   - Monitoring/APM (DD_API_KEY, SENTRY_DSN, NEW_RELIC_*, DATADOG_*)
+   - Email/SMS (SMTP_*, SENDGRID_*, TWILIO_*, MAILGUN_*)
+   - OAuth providers (SLACK_CLIENT_*, GOOGLE_CLIENT_*, GITHUB_CLIENT_*, AUTH0_*)
+   - Analytics (SEGMENT_*, MIXPANEL_*, AMPLITUDE_*)
+   Instead, if the app has a config option to disable these features, set it.
+   For example: FILE_STORAGE=local instead of FILE_STORAGE=s3.
+
+4. Only use valueFrom.secretKeyRef for credentials that are BOTH:
+   (a) absolutely required for the app to start (it will crash without them), AND
+   (b) truly external (not provided by an in-cluster dependency)
+   This should be RARE in a dev environment.
+
+5. ALWAYS check .env.sample, .env.example, .env.development, and similar files
+   for REQUIRED configuration. These files list every env var the app expects.
+   For each variable found:
+   - Skip it if it's an auto-injected dependency URL (DATABASE_URL, REDIS_URL, etc.)
+   - Skip it if it's a dependency credential (POSTGRES_PASSWORD, etc.)
+   - Skip it if it's an optional external integration (AWS_*, DD_*, SENTRY_*, etc.)
+   - For app secrets (SECRET_KEY, SESSION_SECRET, etc.) → set a random 64-char hex value
+   - For URL vars that reference the app itself (URL, BASE_URL, APP_URL, COLLABORATION_URL,
+     etc.) → set to "http://${{ github.actor }}-<name>.localhost"
+   - For feature flags / storage config → set the local/dev option (e.g. FILE_STORAGE=local)
+   - For remaining config → set a sensible dev default
+   Missing a required env var is the #1 cause of pods crashing on startup. When in doubt,
+   include it with a dev-safe default rather than omitting it.
+
+The "env" input is a YAML block that maps directly to a Kubernetes []EnvVar list.
+You MUST use standard Kubernetes EnvVar list format (NOT a map/dict).
+
+Correct format for env vars:
+  env: |
+    - name: SECRET_KEY
+      value: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    - name: NODE_ENV
+      value: "production"
+    - name: FILE_STORAGE
+      value: "local"
+
+WRONG format (this will cause a CRD validation error):
+  env: |
+    SECRET_KEY:
+      value: "some-value"
+
+If any secretKeyRef IS used, those secrets are managed by
+"kindling secrets set <NAME> <VALUE>" and stored as Kubernetes Secrets.
+Include a YAML comment noting which secrets need to be set.
 
 OAuth / public exposure:
 If the repository uses OAuth or OIDC (Auth0, Okta, Firebase Auth, NextAuth, etc.),
@@ -691,6 +957,7 @@ no explanation text, no commentary. Just the YAML.`
 	var b strings.Builder
 
 	b.WriteString(fmt.Sprintf("Generate a kindling dev-deploy.yml GitHub Actions workflow for this repository named %q.\n\n", ctx.name))
+	b.WriteString(fmt.Sprintf("Default branch: %s (use this in the 'on: push: branches:' trigger)\n\n", ctx.branch))
 
 	// Directory tree
 	b.WriteString("## Repository structure\n```\n")
@@ -736,11 +1003,14 @@ no explanation text, no commentary. Just the YAML.`
 
 	// Detected external credentials
 	if len(ctx.externalSecrets) > 0 {
-		b.WriteString("## Detected external credentials\n\n")
-		b.WriteString("The following environment variables appear to be external credentials.\n")
-		b.WriteString("Wire each one into the deploy step(s) using secretKeyRef:\n\n")
+		b.WriteString("## Detected credential-like environment variables\n\n")
+		b.WriteString("The following environment variables were detected in source code.\n")
+		b.WriteString("Apply the dev staging philosophy from the system prompt to decide how to handle each:\n")
+		b.WriteString("- If it is an app-level secret (SECRET_KEY, JWT_SECRET, etc.), set a random hex dev value\n")
+		b.WriteString("- If it is an optional integration (AWS, Datadog, SMTP, OAuth), OMIT it entirely\n")
+		b.WriteString("- If it is truly required AND external, use secretKeyRef with name kindling-secret-<name>\n\n")
 		for _, name := range ctx.externalSecrets {
-			b.WriteString(fmt.Sprintf("- %s → kindling-secret-%s\n", name, strings.ToLower(strings.ReplaceAll(name, "_", "-"))))
+			b.WriteString(fmt.Sprintf("- %s\n", name))
 		}
 		b.WriteString("\n")
 	}
@@ -804,14 +1074,14 @@ jobs:
                 /builds/*.yaml /builds/*.sh
 
       - name: Build image
-        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+        uses: kindling-sh/kindling/.github/actions/kindling-build@main
         with:
           name: sample-app
           context: ${{ github.workspace }}
           image: "${{ env.REGISTRY }}/sample-app:${{ env.TAG }}"
 
       - name: Deploy
-        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+        uses: kindling-sh/kindling/.github/actions/kindling-deploy@main
         with:
           name: "${{ github.actor }}-sample-app"
           image: "${{ env.REGISTRY }}/sample-app:${{ env.TAG }}"
@@ -859,7 +1129,7 @@ jobs:
                 /builds/*.yaml /builds/*.sh
 
       - name: Build API image
-        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+        uses: kindling-sh/kindling/.github/actions/kindling-build@main
         with:
           name: api
           context: ${{ github.workspace }}
@@ -867,14 +1137,14 @@ jobs:
           exclude: "./ui"
 
       - name: Build UI image
-        uses: jeff-vincent/kindling/.github/actions/kindling-build@main
+        uses: kindling-sh/kindling/.github/actions/kindling-build@main
         with:
           name: ui
           context: "${{ github.workspace }}/ui"
           image: "${{ env.REGISTRY }}/ui:${{ env.TAG }}"
 
       - name: Deploy API
-        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+        uses: kindling-sh/kindling/.github/actions/kindling-deploy@main
         with:
           name: "${{ github.actor }}-api"
           image: "${{ env.REGISTRY }}/api:${{ env.TAG }}"
@@ -890,7 +1160,7 @@ jobs:
             - type: redis
 
       - name: Deploy UI
-        uses: jeff-vincent/kindling/.github/actions/kindling-deploy@main
+        uses: kindling-sh/kindling/.github/actions/kindling-deploy@main
         with:
           name: "${{ github.actor }}-ui"
           image: "${{ env.REGISTRY }}/ui:${{ env.TAG }}"
@@ -950,16 +1220,44 @@ var credentialSuffixes = []string{
 	"_WEBHOOK_SECRET",
 }
 
+// dependencyManagedNames are env vars managed by the operator's dependency system.
+// These should NEVER be flagged as external credentials.
+var dependencyManagedNames = map[string]bool{
+	// Connection URLs (auto-injected when dependency is declared)
+	"DATABASE_URL":      true,
+	"REDIS_URL":         true,
+	"MONGO_URL":         true,
+	"MONGODB_URI":       true,
+	"MONGODB_URL":       true,
+	"AMQP_URL":          true,
+	"RABBITMQ_URL":      true,
+	"KAFKA_BROKER_URL":  true,
+	"KAFKA_BROKERS":     true,
+	"ELASTICSEARCH_URL": true,
+	"S3_ENDPOINT":       true,
+	"NATS_URL":          true,
+	"MEMCACHED_URL":     true,
+	"CASSANDRA_URL":     true,
+	"CONSUL_HTTP_ADDR":  true,
+	"VAULT_ADDR":        true,
+	"INFLUXDB_URL":      true,
+	"JAEGER_ENDPOINT":   true,
+	// Dependency credentials (managed by operator defaults)
+	"POSTGRES_PASSWORD":  true,
+	"POSTGRES_USER":      true,
+	"POSTGRES_DB":        true,
+	"DATABASE_PASSWORD":  true,
+	"MYSQL_PASSWORD":     true,
+	"MYSQL_ROOT_PASSWORD": true,
+	"MYSQL_USER":         true,
+	"MYSQL_DATABASE":     true,
+	"REDIS_PASSWORD":     true,
+	"MONGO_INITDB_ROOT_USERNAME": true,
+	"MONGO_INITDB_ROOT_PASSWORD": true,
+}
+
 // credentialExactNames are full env var names that indicate external credentials.
 var credentialExactNames = map[string]bool{
-	"DATABASE_URL":          true,
-	"REDIS_URL":             true,
-	"MONGO_URL":             true,
-	"MONGODB_URI":           true,
-	"AMQP_URL":              true,
-	"RABBITMQ_URL":          true,
-	"KAFKA_BROKERS":         true,
-	"ELASTICSEARCH_URL":     true,
 	"STRIPE_KEY":            true,
 	"SENDGRID_API_KEY":      true,
 	"TWILIO_AUTH_TOKEN":     true,
@@ -1067,6 +1365,10 @@ func isDigit(b byte) bool {
 
 // isExternalCredential checks if an env var name matches credential patterns.
 func isExternalCredential(name string) bool {
+	// Never flag dependency-managed env vars
+	if dependencyManagedNames[name] {
+		return false
+	}
 	if credentialExactNames[name] {
 		return true
 	}
